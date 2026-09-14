@@ -3,10 +3,16 @@
 ## [Unreleased]
 
 ### Added
-- Optional extra sources for Claude Code, Codex CLI, and Grok Build CLI session logs. Off by default; enable under `usage-extension.sources` in `settings.json`. Extra trees are not walked unless enabled.
-- Token mapping: Claude Code uncached `input_tokens` + cache create/read; Codex/Grok split inclusive input vs cache read; Grok `costUsdTicks` (1e-10 USD); Codex counts only `token_usage_record.usage`.
-- When an extra-source log has tokens but no invoice, estimate USD from Pi catalog rates so cost graphs/tables/insights include Claude Code and Codex CLI. Cache format **v6** (one rebuild).
-- OpenCode Go/CLI (`opencodeGo`): `storage/message/msg_*.json` only. Spark contributor catalog rates; GLM folds into `zai`.
+- Optional extra sources, **off by default**. Enable under `usage-extension.sources` in `settings.json`; disabled trees are not walked.
+  - Claude Code → `anthropic`
+  - Codex CLI → `openai-codex`
+  - Grok Build CLI (and Pi `grok-build` / `xai-grok-build`) → `xai`
+  - OpenCode Go/CLI (`opencodeGo`, alias `opencode`) → `opencode-go` (GLM via `zai-coding-plan` still folds into `zai`)
+- Token mapping: Claude Code uncached `input_tokens` + cache create/read; Codex/Grok split inclusive input vs cache read; Codex counts only `token_usage_record.usage`; Grok `turn_completed` + `costUsdTicks` (1e-10 USD); OpenCode `storage/message/msg_*.json` only (never `storage/part`).
+- When an extra-source log has tokens but no invoice, estimate USD from Pi catalog rates. Cache format **v6** (one rebuild).
+
+### Changed
+- Graph/table: `opencode-go` and `muse-spark-*` stay first-class series (not folded into `other`). Synthetic `Tools` sorts last among named providers.
 
 ## [0.9.4] - 2026-07-22
 
