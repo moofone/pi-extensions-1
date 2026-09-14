@@ -15,6 +15,10 @@
  * - Grok only counts `sessionUpdate === "turn_completed"`; in-progress turns
  *   have no usage row.
  * - Grok `costUsdTicks` is 1e-10 USD.
+ * - OpenCode Go/CLI: per-message JSON under `storage/message/` (never `storage/part/`).
+ *   `tokens.input` is already uncached; cache read/write are separate. Reasoning is a
+ *   subset of output. `cost` is used when > 0, otherwise catalog rates (including
+ *   `opencode-go/muse-spark-1.3-contributor`).
  */
 
 import { readdir } from "node:fs/promises";
@@ -23,7 +27,7 @@ import { join } from "node:path";
 
 import type { ParsedSessionFile, SessionMessage, UsageAmount } from "./data.ts";
 
-export type ExtraSourceKind = "claude-code" | "codex-cli" | "grok-build";
+export type ExtraSourceKind = "claude-code" | "codex-cli" | "grok-build" | "opencode-go";
 export type UsageFileKind = "pi" | ExtraSourceKind;
 
 export interface SourceRootConfig {
@@ -35,6 +39,7 @@ export interface ResolvedUsageSources {
 	claudeCode: SourceRootConfig;
 	codexCli: SourceRootConfig;
 	grokBuild: SourceRootConfig;
+	opencodeGo: SourceRootConfig;
 }
 
 /** JSON shape under `settings.json` → `usage-extension.sources`. */
@@ -44,6 +49,9 @@ export interface UsageSourcesSetting {
 	claudeCode?: UsageSourceSetting;
 	codexCli?: UsageSourceSetting;
 	grokBuild?: UsageSourceSetting;
+	opencodeGo?: UsageSourceSetting;
+	/** Alias accepted in settings; same store as `opencodeGo`. */
+	opencode?: UsageSourceSetting;
 }
 
 export function disabledUsageSources(): ResolvedUsageSources {
@@ -51,11 +59,17 @@ export function disabledUsageSources(): ResolvedUsageSources {
 		claudeCode: { enabled: false, roots: [] },
 		codexCli: { enabled: false, roots: [] },
 		grokBuild: { enabled: false, roots: [] },
+		opencodeGo: { enabled: false, roots: [] },
 	};
 }
 
 export function anyExtraSourceEnabled(sources: ResolvedUsageSources): boolean {
-	return sources.claudeCode.enabled || sources.codexCli.enabled || sources.grokBuild.enabled;
+	return (
+		sources.claudeCode.enabled ||
+		sources.codexCli.enabled ||
+		sources.grokBuild.enabled ||
+		sources.opencodeGo.enabled
+	);
 }
 
 const GROK_COST_TICKS_PER_USD = 10_000_000_000;
@@ -123,6 +137,14 @@ export function defaultGrokBuildRoots(home: string, env: NodeJS.ProcessEnv): str
 	return [join(home, ".grok", "sessions")];
 }
 
+export function defaultOpenCodeGoRoots(home: string, env: NodeJS.ProcessEnv): string[] {
+	const fromEnv = (env.OPENCODE_DATA_DIR ?? "").trim();
+	if (fromEnv) return splitPathList(fromEnv).map((root) => expandHome(root, home));
+	const xdg = (env.XDG_DATA_HOME ?? "").trim();
+	if (xdg) return [join(expandHome(xdg, home), "opencode")];
+	return [join(home, ".local", "share", "opencode")];
+}
+
 /**
  * Parse `usage-extension.sources` from settings.json. Missing/invalid files
  * yield every extra source disabled so `/usage` stays Pi-only by default.
@@ -141,6 +163,7 @@ export function parseUsageSourcesSetting(
 			claudeCode: resolveOneSource(sources.claudeCode, defaultClaudeCodeRoots(home, env), home),
 			codexCli: resolveOneSource(sources.codexCli, defaultCodexCliRoots(home, env), home),
 			grokBuild: resolveOneSource(sources.grokBuild, defaultGrokBuildRoots(home, env), home),
+			opencodeGo: resolveOneSource(sources.opencodeGo ?? sources.opencode, defaultOpenCodeGoRoots(home, env), home),
 		};
 	} catch {
 		return disabled;
@@ -167,6 +190,23 @@ export async function collectNamedFiles(dir: string, fileName: string, signal?: 
 	const files: string[] = [];
 	await walkFiles(dir, (name, path) => {
 		if (name === fileName) files.push(path);
+	}, signal);
+	files.sort();
+	return files;
+}
+
+/** Resolve OpenCode root to `storage/message` so `storage/part` is never walked. */
+export function openCodeMessageRoot(root: string): string {
+	const normalized = root.replace(/[/\\]+$/, "");
+	if (normalized.endsWith("/storage/message") || normalized.endsWith("\\storage\\message")) return normalized;
+	if (normalized.endsWith("/storage") || normalized.endsWith("\\storage")) return join(normalized, "message");
+	return join(normalized, "storage", "message");
+}
+
+export async function collectOpenCodeMessageFiles(root: string, signal?: AbortSignal): Promise<string[]> {
+	const files: string[] = [];
+	await walkFiles(openCodeMessageRoot(root), (name, path) => {
+		if (name.startsWith("msg_") && name.endsWith(".json")) files.push(path);
 	}, signal);
 	files.sort();
 	return files;
@@ -297,19 +337,36 @@ const MODEL_RATES: Record<string, TokenRates> = {
 	"gpt-5.6-terra": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
 	"grok-4.6": { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
 	"grok-4.5": { input: 2, output: 6, cacheRead: 0.3, cacheWrite: 0 },
+	"glm-4.7": { input: 0.6, output: 2.2, cacheRead: 0.11, cacheWrite: 0 },
+	"glm-5": { input: 1, output: 3.2, cacheRead: 0.2, cacheWrite: 0 },
+	"glm-5.1": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	"glm-5.2": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	"glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	"glm-5.3-flash": { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 },
+	"muse-spark-1.3-contributor-free": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	"muse-spark-1.2-contributor-free": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	"opencode-go/muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	"opencode-go/muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	"muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	"muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	"muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+	"muse-spark-1.2": { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 };
 
 const PROVIDER_RATES: Record<string, TokenRates> = {
 	anthropic: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 	"openai-codex": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
 	xai: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+	zai: { input: 0.6, output: 2.2, cacheRead: 0.11, cacheWrite: 0 },
+	"opencode-go": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
+	opencode: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 };
 
 const ZERO_RATES: TokenRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 export function ratesFor(provider: string, model: string): TokenRates {
 	const stripped = model.replace(/-build$/, "");
-	for (const id of [model, stripped]) {
+	for (const id of [`${provider}/${model}`, model, `${provider}/${stripped}`, stripped]) {
 		const exact = MODEL_RATES[id];
 		if (exact) return exact;
 	}
@@ -540,6 +597,69 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 	return { sessionId, cwd, messages, toolUsages: [] };
 }
 
+export function mapOpenCodeProvider(providerID: string): string {
+	const id = providerID.toLowerCase();
+	if (!id) return "opencode";
+	if (id === "opencode-go" || id === "opencode-zen" || id === "zen") return "opencode-go";
+	if (id.includes("zai") || id.includes("zhipu")) return "zai";
+	if (id.includes("anthropic") || id === "claude") return "anthropic";
+	if (id.includes("codex")) return "openai-codex";
+	if (id.includes("xai") || id.includes("grok")) return "xai";
+	return providerID;
+}
+
+export function openCodeTokenAmount(tokens: Record<string, unknown>, cost: unknown): UsageAmount | null {
+	const cache = asRecord(tokens.cache);
+	return amountOrNull({
+		cost: finiteNumber(cost),
+		input: finiteNumber(tokens.input),
+		output: finiteNumber(tokens.output),
+		cacheRead: finiteNumber(cache?.read),
+		cacheWrite: finiteNumber(cache?.write),
+		reasoning: finiteNumber(tokens.reasoning),
+	});
+}
+
+export async function parseOpenCodeGoBuffer(buffer: Buffer, _signal?: AbortSignal): Promise<ParsedSessionFile> {
+	let entry: Record<string, unknown> | null = null;
+	try {
+		entry = asRecord(JSON.parse(buffer.toString("utf8")));
+	} catch {
+		return { sessionId: "", cwd: "", messages: [], toolUsages: [] };
+	}
+	if (!entry) return { sessionId: "", cwd: "", messages: [], toolUsages: [] };
+	const sessionId = typeof entry.sessionID === "string" ? entry.sessionID : "";
+	const pathInfo = asRecord(entry.path);
+	const cwd = typeof pathInfo?.cwd === "string" ? pathInfo.cwd : "";
+	if (entry.role !== "assistant") {
+		return { sessionId, cwd, messages: [], toolUsages: [] };
+	}
+	const tokens = asRecord(entry.tokens);
+	if (!tokens) return { sessionId, cwd, messages: [], toolUsages: [] };
+	const amount = openCodeTokenAmount(tokens, entry.cost);
+	if (!amount) return { sessionId, cwd, messages: [], toolUsages: [] };
+	const model = typeof entry.modelID === "string" && entry.modelID ? entry.modelID : "unknown";
+	const provider = mapOpenCodeProvider(typeof entry.providerID === "string" ? entry.providerID : "");
+	const time = asRecord(entry.time);
+	const timestamp = toMillis(time?.completed ?? time?.created);
+	const sourceId = typeof entry.id === "string" ? entry.id : "";
+	return {
+		sessionId,
+		cwd,
+		messages: [
+			assistantMessage({
+				provider,
+				model,
+				thinkingLevel: "",
+				sourceId,
+				timestamp,
+				...withPricedCost(provider, model, amount),
+			}),
+		],
+		toolUsages: [],
+	};
+}
+
 export async function parseUsageFileBuffer(
 	kind: UsageFileKind,
 	buffer: Buffer,
@@ -553,6 +673,8 @@ export async function parseUsageFileBuffer(
 			return parseCodexCliBuffer(buffer, signal);
 		case "grok-build":
 			return parseGrokBuildBuffer(buffer, signal);
+		case "opencode-go":
+			return parseOpenCodeGoBuffer(buffer, signal);
 		case "pi":
 			if (!parsePi) throw new Error("parseUsageFileBuffer(pi) requires parsePi");
 			return parsePi(buffer, signal);

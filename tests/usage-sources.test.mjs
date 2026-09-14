@@ -9,12 +9,16 @@ import {
 	claudeCodeTokenAmount,
 	codexCliTokenAmount,
 	collectNamedFiles,
+	collectOpenCodeMessageFiles,
 	disabledUsageSources,
 	estimateUsd,
 	grokBuildTokenAmount,
+	mapOpenCodeProvider,
+	openCodeTokenAmount,
 	parseClaudeCodeBuffer,
 	parseCodexCliBuffer,
 	parseGrokBuildBuffer,
+	parseOpenCodeGoBuffer,
 	parseUsageSourcesSetting,
 } from "../usage-extension/sources.ts";
 
@@ -92,17 +96,34 @@ test("parseUsageSourcesSetting enables default roots from booleans and honors pa
 	assert.deepEqual(parsed.codexCli.roots, [join(home, "codex-alt")]);
 	assert.equal(parsed.grokBuild.enabled, false);
 	assert.deepEqual(parsed.grokBuild.roots, []);
+	assert.equal(parsed.opencodeGo.enabled, false);
 });
 
 test("parseUsageSourcesSetting prefers CLAUDE_CONFIG_DIR / CODEX_HOME / GROK_HOME", () => {
 	const parsed = parseUsageSourcesSetting(
-		JSON.stringify({ "usage-extension": { sources: { claudeCode: true, codexCli: true, grokBuild: true } } }),
+		JSON.stringify({ "usage-extension": { sources: { claudeCode: true, codexCli: true, grokBuild: true, opencodeGo: true } } }),
 		"/home/u",
-		{ CLAUDE_CONFIG_DIR: "/custom/claude", CODEX_HOME: "/custom/codex", GROK_HOME: "~/g" },
+		{
+			CLAUDE_CONFIG_DIR: "/custom/claude",
+			CODEX_HOME: "/custom/codex",
+			GROK_HOME: "~/g",
+			OPENCODE_DATA_DIR: "/custom/oc,/backup/oc",
+		},
 	);
 	assert.deepEqual(parsed.claudeCode.roots, [join("/custom/claude", "projects")]);
 	assert.deepEqual(parsed.codexCli.roots, [join("/custom/codex", "sessions")]);
 	assert.deepEqual(parsed.grokBuild.roots, [join("/home/u", "g", "sessions")]);
+	assert.deepEqual(parsed.opencodeGo.roots, ["/custom/oc", "/backup/oc"]);
+});
+
+test("parseUsageSourcesSetting accepts opencode as an alias for opencodeGo", () => {
+	const parsed = parseUsageSourcesSetting(
+		JSON.stringify({ "usage-extension": { sources: { opencode: true } } }),
+		"/home/u",
+		{},
+	);
+	assert.equal(parsed.opencodeGo.enabled, true);
+	assert.deepEqual(parsed.opencodeGo.roots, [join("/home/u", ".local", "share", "opencode")]);
 });
 
 // =============================================================================
@@ -644,4 +665,201 @@ test("collectUsageData extra-source files with unique sourceIds do not collapse 
 	});
 	assert.equal(data.allTime.providers.get("anthropic").messages, 2);
 	assert.equal(data.allTime.providers.get("anthropic").tokens.input, 2);
+});
+
+// =============================================================================
+// OpenCode Go
+// =============================================================================
+
+function ocAssistant({
+	id = "msg_1",
+	sessionID = "ses_1",
+	modelID = "muse-spark-1.3-contributor",
+	providerID = "opencode-go",
+	created = TS_TODAY,
+	cost = 0,
+	input = 1000,
+	output = 40,
+	reasoning = 10,
+	cacheRead = 200,
+	cacheWrite = 0,
+	cwd = "/proj",
+	error = undefined,
+} = {}) {
+	return {
+		id,
+		sessionID,
+		role: "assistant",
+		time: { created, completed: created + 1 },
+		modelID,
+		providerID,
+		path: { cwd, root: "/" },
+		cost,
+		tokens: { input, output, reasoning, cache: { read: cacheRead, write: cacheWrite } },
+		...(error ? { error } : {}),
+	};
+}
+
+test("mapOpenCodeProvider folds Z.AI plans into zai and keeps opencode-go", () => {
+	assert.equal(mapOpenCodeProvider("zai-coding-plan"), "zai");
+	assert.equal(mapOpenCodeProvider("zhipu"), "zai");
+	assert.equal(mapOpenCodeProvider("opencode-go"), "opencode-go");
+	assert.equal(mapOpenCodeProvider("opencode-zen"), "opencode-go");
+});
+
+test("openCodeTokenAmount does not subtract cache from input", () => {
+	assert.deepEqual(
+		openCodeTokenAmount({ input: 28069, output: 431, reasoning: 10, cache: { read: 467, write: 3 } }, 0),
+		{ cost: 0, input: 28069, output: 431, cacheRead: 467, cacheWrite: 3, reasoning: 10 },
+	);
+});
+
+test("estimateUsd prices muse-spark-1.3-contributor at OpenCode Go catalog rates", () => {
+	assert.equal(
+		estimateUsd("opencode-go", "muse-spark-1.3-contributor", {
+			cost: 0,
+			input: 1_000_000,
+			output: 1_000_000,
+			cacheRead: 1_000_000,
+			cacheWrite: 0,
+			reasoning: 0,
+		}),
+		0.302,
+	);
+	assert.equal(
+		estimateUsd("opencode", "muse-spark-1.3-contributor-free", {
+			cost: 0,
+			input: 1_000_000,
+			output: 1_000_000,
+			cacheRead: 0,
+			cacheWrite: 0,
+			reasoning: 0,
+		}),
+		0,
+	);
+});
+
+test("parseOpenCodeGoBuffer counts assistant tokens and skips user/zero-token errors", async () => {
+	const assistant = await parseOpenCodeGoBuffer(Buffer.from(JSON.stringify(ocAssistant()), "utf8"));
+	assert.equal(assistant.sessionId, "ses_1");
+	assert.equal(assistant.cwd, "/proj");
+	assert.equal(assistant.messages.length, 1);
+	assert.equal(assistant.messages[0].provider, "opencode-go");
+	assert.equal(assistant.messages[0].model, "muse-spark-1.3-contributor");
+	assert.equal(assistant.messages[0].input, 1000);
+	assert.equal(assistant.messages[0].cacheRead, 200);
+	assert.equal(assistant.messages[0].reasoning, 10);
+	assert.equal(
+		assistant.messages[0].cost,
+		estimateUsd("opencode-go", "muse-spark-1.3-contributor", {
+			cost: 0,
+			input: 1000,
+			output: 40,
+			cacheRead: 200,
+			cacheWrite: 0,
+			reasoning: 10,
+		}),
+	);
+
+	const user = await parseOpenCodeGoBuffer(
+		Buffer.from(JSON.stringify({ id: "msg_u", sessionID: "ses_1", role: "user", time: { created: TS_TODAY } }), "utf8"),
+	);
+	assert.equal(user.messages.length, 0);
+	assert.equal(user.sessionId, "ses_1");
+
+	const failed = await parseOpenCodeGoBuffer(
+		Buffer.from(
+			JSON.stringify(
+				ocAssistant({
+					error: { name: "APIError" },
+					input: 0,
+					output: 0,
+					reasoning: 0,
+					cacheRead: 0,
+					cost: 0,
+				}),
+			),
+			"utf8",
+		),
+	);
+	assert.equal(failed.messages.length, 0);
+});
+
+test("parseOpenCodeGoBuffer keeps a recorded invoice instead of estimating", async () => {
+	const parsed = await parseOpenCodeGoBuffer(
+		Buffer.from(JSON.stringify(ocAssistant({ cost: 1.25, input: 1000, output: 40 })), "utf8"),
+	);
+	assert.equal(parsed.messages[0].cost, 1.25);
+});
+
+test("collectOpenCodeMessageFiles only lists msg_*.json under storage/message", async (t) => {
+	const { root } = fixture(t);
+	const msgDir = join(root, "storage", "message", "ses_1");
+	const partDir = join(root, "storage", "part", "msg_1");
+	mkdirSync(msgDir, { recursive: true });
+	mkdirSync(partDir, { recursive: true });
+	writeFileSync(join(msgDir, "msg_abc.json"), "{}");
+	writeFileSync(join(msgDir, "other.json"), "{}");
+	writeFileSync(join(partDir, "prt_1.json"), "{}");
+	const files = await collectOpenCodeMessageFiles(root);
+	assert.deepEqual(files, [join(msgDir, "msg_abc.json")]);
+});
+
+test("collectUsageData folds OpenCode Go spark into opencode-go and GLM into zai", async (t) => {
+	const { root, sessionsDir, cachePath } = fixture(t);
+	writeFileSync(
+		join(sessionsDir, "pi.jsonl"),
+		[piSession("s-pi", TS_TODAY), piAssistant({ ts: TS_TODAY, provider: "zai", model: "glm-4.7", cost: 0.5, input: 10, output: 2 })].join("\n") + "\n",
+	);
+	const oc = join(root, "opencode");
+	const sparkDir = join(oc, "storage", "message", "ses_spark");
+	const glmDir = join(oc, "storage", "message", "ses_glm");
+	mkdirSync(sparkDir, { recursive: true });
+	mkdirSync(glmDir, { recursive: true });
+	writeFileSync(
+		join(sparkDir, "msg_spark.json"),
+		JSON.stringify(
+			ocAssistant({
+				id: "msg_spark",
+				sessionID: "ses_spark",
+				modelID: "muse-spark-1.3-contributor",
+				providerID: "opencode-go",
+				input: 20_000,
+				output: 100,
+				cacheRead: 5_000,
+			}),
+		),
+	);
+	writeFileSync(
+		join(glmDir, "msg_glm.json"),
+		JSON.stringify(
+			ocAssistant({
+				id: "msg_glm",
+				sessionID: "ses_glm",
+				modelID: "glm-4.7",
+				providerID: "zai-coding-plan",
+				input: 50,
+				output: 5,
+				cacheRead: 0,
+			}),
+		),
+	);
+
+	const data = await collectUsageData({
+		sessionsDir,
+		cachePath,
+		now: NOW,
+		sources: sourcesFor({ opencodeGo: { enabled: true, roots: [oc] } }),
+	});
+
+	const spark = data.allTime.providers.get("opencode-go");
+	assert.ok(spark, "opencode-go provider missing");
+	assert.equal(spark.messages, 1);
+	assert.equal(spark.models.get("muse-spark-1.3-contributor").tokens.input, 20_000);
+	assert.ok(spark.cost > 0);
+
+	const zai = data.allTime.providers.get("zai");
+	assert.equal(zai.messages, 2);
+	assert.equal(zai.models.get("glm-4.7").tokens.input, 60);
+	assert.ok(zai.cost > 0.5);
 });

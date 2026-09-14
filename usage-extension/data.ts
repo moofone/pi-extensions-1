@@ -19,11 +19,13 @@ import {
 	anyExtraSourceEnabled,
 	collectJsonlFiles,
 	collectNamedFiles,
+	collectOpenCodeMessageFiles,
 	disabledUsageSources,
 	fallbackSessionId,
 	parseClaudeCodeBuffer,
 	parseCodexCliBuffer,
 	parseGrokBuildBuffer,
+	parseOpenCodeGoBuffer,
 } from "./sources.ts";
 import type { ResolvedUsageSources, UsageFileKind } from "./sources.ts";
 
@@ -1448,6 +1450,12 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 				if (signal?.aborted) return null;
 			}
 		}
+		if (sources.opencodeGo.enabled) {
+			for (const root of sources.opencodeGo.roots) {
+				addFiles(await collectOpenCodeMessageFiles(root, signal), "opencode-go");
+				if (signal?.aborted) return null;
+			}
+		}
 	}
 
 	// 2. Stat them (batched) so cache freshness can be checked without reading contents.
@@ -1545,7 +1553,9 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 								? await parseCodexCliBuffer(buffer, signal)
 								: kind === "grok-build"
 									? await parseGrokBuildBuffer(buffer, signal)
-									: await parseSessionBuffer(buffer, signal);
+									: kind === "opencode-go"
+										? await parseOpenCodeGoBuffer(buffer, signal)
+										: await parseSessionBuffer(buffer, signal);
 					if (signal?.aborted) return; // Never cache a partial parse.
 					parsed.sessionId = fallbackSessionId(kind, filePath, parsed.sessionId);
 					current.set(filePath, { size: st.size, mtimeMs: st.mtimeMs, parsed });
