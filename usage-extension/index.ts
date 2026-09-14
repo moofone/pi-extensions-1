@@ -15,6 +15,7 @@ import { CancellableLoader, Container, Spacer, matchesKey, visibleWidth, truncat
 
 import { collectUsageData, getAgentDir, TAB_ORDER } from "./data";
 import type { CollectProgress } from "./data";
+import { parseUsageSourcesSetting } from "./sources";
 import type { BaseStats, ProviderStats, TabName, TotalStats, UsageData } from "./data";
 import {
 	buildGraphModel,
@@ -966,7 +967,13 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				collectUsageData({ signal: loader.signal, onProgress })
+				let sources;
+				try {
+					sources = parseUsageSourcesSetting(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
+				} catch {
+					sources = undefined;
+				}
+				collectUsageData({ signal: loader.signal, onProgress, sources })
 					.then(finish)
 					.catch(() => finish(null));
 

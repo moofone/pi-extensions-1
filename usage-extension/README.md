@@ -193,7 +193,7 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 
 ## Performance & Caching
 
-`/usage` builds its stats from every session JSONL file under `<agentDir>/sessions`. To keep opens fast on large histories (multi-GB, thousands of files):
+`/usage` builds its stats from every session JSONL file under `<agentDir>/sessions`, plus any extra stores you opt into (see [Extra sources](#extra-sources)). Disabled extra sources are not walked. To keep opens fast on large histories (multi-GB, thousands of files):
 
 - **On-disk cache.** Per-file extraction results are cached in `<agentDir>/usage-extension-cache.json` (respects `PI_CODING_AGENT_DIR`), keyed by file size + mtime. Warm opens only re-parse session files that changed since the last run — on a 5.2 GB / 3,310-file corpus that takes the open from ~17 s to ~0.3 s.
 - **First open** after install (or after deleting the cache) does a one-off full build, showing the usual cancellable loader. Cancelling saves partial progress, so the next open resumes where it left off.
@@ -230,6 +230,41 @@ Statistics are parsed recursively from session files in `~/.pi/agent/sessions/`,
 Assistant messages duplicated across branched session files are deduplicated by timestamp + total tokens. Auxiliary usage is deduplicated by its stable session entry id, which avoids collapsing parallel tools that happen to report identical usage. Nested-agent reports are suppressed when their child session files are part of the scan (resolved across all copies of the parent entry, since branch copies change runId-derived paths); reports whose children are missing stay under `Tools / summaries`. Tool and summary usage contributes cost and tokens to totals, graphs, project/session mix, and burn trend, but does not count as an assistant message or distort conversation context/cache insights.
 
 Respects the `PI_CODING_AGENT_DIR` environment variable if set.
+
+## Extra sources
+
+Off by default. When enabled, `/usage` folds other local agent logs into the same provider/model buckets as Pi:
+
+| Setting | Default roots | Folded as |
+| --- | --- | --- |
+| `claudeCode` | `~/.claude/projects`, `~/.config/claude/projects` (`CLAUDE_CONFIG_DIR` if set) | `anthropic` |
+| `codexCli` | `~/.codex/sessions` (`CODEX_HOME` if set) | `openai-codex` |
+| `grokBuild` | `~/.grok/sessions` (`GROK_HOME` if set); only `updates.jsonl` | `xai` |
+
+```json
+{
+  "usage-extension": {
+    "sources": {
+      "claudeCode": true,
+      "codexCli": true,
+      "grokBuild": true
+    }
+  }
+}
+```
+
+Override a root with `{ "enabled": true, "path": "~/other" }` or `paths: ["...", "..."]`. Run `/reload` after editing settings.
+
+Mapping notes (correctness):
+
+- Claude Code `input_tokens` is uncached; cache create/read are separate fields.
+- Codex CLI and Grok Build include cache reads in input; `/usage` splits them so `↑In` stays fresh tokens.
+- Codex `turn_token_usage` / `thread_token_usage` are ignored (cumulatives). Only each `token_usage_record.usage` is counted.
+- Grok only counts `sessionUpdate: "turn_completed"`. Cost uses `costUsdTicks` (1e-10 USD). In-progress turns are omitted.
+- Model ids are kept as recorded (`grok-4.6` vs `grok-4.6-build` stay distinct rows).
+- Claude Code / Codex CLI usually have no persisted USD; their cost column stays `—` unless the log includes it. Tokens still merge.
+
+The first open after enabling a source parses those files once, then the same size+mtime cache applies.
 
 ## Changelog
 

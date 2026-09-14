@@ -15,6 +15,18 @@ import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import {
+	anyExtraSourceEnabled,
+	collectJsonlFiles,
+	collectNamedFiles,
+	disabledUsageSources,
+	fallbackSessionId,
+	parseClaudeCodeBuffer,
+	parseCodexCliBuffer,
+	parseGrokBuildBuffer,
+} from "./sources.ts";
+import type { ResolvedUsageSources, UsageFileKind } from "./sources.ts";
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -1369,6 +1381,8 @@ export interface CollectUsageOptions {
 	/** Reference time for period bucketing. Defaults to `new Date()`. */
 	now?: Date;
 	parseConcurrency?: number;
+	/** Extra local stores. Default is every extra source disabled (Pi sessions only). */
+	sources?: ResolvedUsageSources;
 }
 
 export async function collectUsageData(options: CollectUsageOptions = {}): Promise<UsageData | null> {
@@ -1377,6 +1391,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 	const sessionsDir = options.sessionsDir ?? getSessionsDir();
 	const cachePath = options.cachePath === undefined ? getDefaultCachePath() : options.cachePath;
 	const parseConcurrency = Math.max(1, options.parseConcurrency ?? DEFAULT_PARSE_CONCURRENCY);
+	const sources = options.sources ?? disabledUsageSources();
 
 	const startOfToday = new Date(now);
 	startOfToday.setHours(0, 0, 0, 0);
@@ -1401,9 +1416,39 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 	startOfLast30Days.setDate(startOfLast30Days.getDate() - 29);
 	const last30DaysStartMs = startOfLast30Days.getTime();
 
-	// 1. Discover session files.
-	const filePaths = await getAllSessionFiles(sessionsDir, signal);
+	// 1. Discover session files. Pi first; extra stores are opt-in and skipped
+	// entirely when disabled so the default path does not walk ~/.claude etc.
+	const fileKinds = new Map<string, UsageFileKind>();
+	const filePaths: string[] = [];
+	const addFiles = (paths: string[], kind: UsageFileKind): void => {
+		for (const filePath of paths) {
+			if (fileKinds.has(filePath)) continue;
+			fileKinds.set(filePath, kind);
+			filePaths.push(filePath);
+		}
+	};
+	addFiles(await getAllSessionFiles(sessionsDir, signal), "pi");
 	if (signal?.aborted) return null;
+	if (anyExtraSourceEnabled(sources)) {
+		if (sources.claudeCode.enabled) {
+			for (const root of sources.claudeCode.roots) {
+				addFiles(await collectJsonlFiles(root, signal), "claude-code");
+				if (signal?.aborted) return null;
+			}
+		}
+		if (sources.codexCli.enabled) {
+			for (const root of sources.codexCli.roots) {
+				addFiles(await collectJsonlFiles(root, signal), "codex-cli");
+				if (signal?.aborted) return null;
+			}
+		}
+		if (sources.grokBuild.enabled) {
+			for (const root of sources.grokBuild.roots) {
+				addFiles(await collectNamedFiles(root, "updates.jsonl", signal), "grok-build");
+				if (signal?.aborted) return null;
+			}
+		}
+	}
 
 	// 2. Stat them (batched) so cache freshness can be checked without reading contents.
 	const fileStats = new Map<string, { size: number; mtimeMs: number }>();
@@ -1492,8 +1537,17 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 						filesParsed++;
 						continue; // File vanished — skip it.
 					}
-					const parsed = await parseSessionBuffer(buffer, signal);
+					const kind = fileKinds.get(filePath) ?? "pi";
+					const parsed =
+						kind === "claude-code"
+							? await parseClaudeCodeBuffer(buffer, signal)
+							: kind === "codex-cli"
+								? await parseCodexCliBuffer(buffer, signal)
+								: kind === "grok-build"
+									? await parseGrokBuildBuffer(buffer, signal)
+									: await parseSessionBuffer(buffer, signal);
 					if (signal?.aborted) return; // Never cache a partial parse.
+					parsed.sessionId = fallbackSessionId(kind, filePath, parsed.sessionId);
 					current.set(filePath, { size: st.size, mtimeMs: st.mtimeMs, parsed });
 					filesParsed++;
 					if (filesParsed % PROGRESS_REPORT_EVERY === 0 || filesParsed === toParse.length) {
@@ -1565,9 +1619,11 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 			// Pi entry ids survive copied branch history and distinguish parallel
 			// tool results that happen to report identical usage in the same ms.
 			const tokenFingerprint = m.input + m.output + m.cacheRead + m.cacheWrite;
+			// Extra-source parsers set sourceId so two same-ms turns don't collapse.
+			// Pi assistant messages keep sourceId "" so branched copies still dedupe.
 			const hash =
-				m.source === "auxiliary" && m.sourceId
-					? `auxiliary:${m.sourceId}:${m.timestamp}:${tokenFingerprint}`
+				m.sourceId !== ""
+					? `${m.source}:${m.sourceId}:${m.timestamp}:${tokenFingerprint}`
 					: `${m.source}:${m.timestamp}:${tokenFingerprint}`;
 			if (seenHashes.has(hash)) continue;
 			seenHashes.add(hash);
