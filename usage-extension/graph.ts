@@ -39,6 +39,16 @@ export const GROUP_LABELS: Record<GraphGroupBy, string> = {
 /** Series beyond this cap are merged into a single "other" series. */
 export const MAX_GROUP_SERIES = 6;
 
+/** Always their own legend/plot series; never folded into "other". */
+export const FIRST_CLASS_PROVIDERS = new Set(["opencode-go"]);
+export const FIRST_CLASS_MODEL_PREFIXES = ["muse-spark-"];
+
+export function isFirstClassGroup(groupBy: GraphGroupBy, key: string): boolean {
+	if (groupBy === "provider") return FIRST_CLASS_PROVIDERS.has(key);
+	if (groupBy === "model") return FIRST_CLASS_MODEL_PREFIXES.some((prefix) => key.startsWith(prefix));
+	return false;
+}
+
 export const TOTAL_SERIES_KEY = "\u0000total";
 export const OTHER_SERIES_KEY = "\u0000other";
 
@@ -134,6 +144,7 @@ function domainFor(period: TabName, bounds: PeriodBounds, hourly: Map<number, Ma
  *
  * Buckets are hourly for short periods and daily for long ones. Group series
  * are capped at MAX_GROUP_SERIES by period total; the rest merge into "other".
+ * First-class extra sources (opencode-go / muse-spark-*) always keep their own series.
  * A Total series is always present (first). Hidden series keep their points
  * but are excluded from the y-axis scale.
  */
@@ -180,9 +191,15 @@ export function buildGraphModel(
 	}
 
 	// Rank groups and cap at MAX_GROUP_SERIES; merge the tail into "other".
+	// First-class keys stay their own series even when they rank below the cap.
 	const ranked = Array.from(groupTotals.entries()).sort((a, b) => b[1] - a[1]);
-	const kept = ranked.slice(0, MAX_GROUP_SERIES);
-	const merged = ranked.slice(MAX_GROUP_SERIES);
+	const rest = ranked.filter(([key]) => !isFirstClassGroup(options.groupBy, key));
+	const keptKeys = new Set([
+		...ranked.filter(([key]) => isFirstClassGroup(options.groupBy, key)).map(([key]) => key),
+		...rest.slice(0, MAX_GROUP_SERIES).map(([key]) => key),
+	]);
+	const kept = ranked.filter(([key]) => keptKeys.has(key));
+	const merged = ranked.filter(([key]) => !keptKeys.has(key));
 
 	const hidden = options.hidden ?? new Set<string>();
 	const series: GraphSeries[] = [];

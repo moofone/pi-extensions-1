@@ -704,6 +704,7 @@ test("mapOpenCodeProvider folds Z.AI plans into zai and keeps opencode-go", () =
 	assert.equal(mapOpenCodeProvider("zai-coding-plan"), "zai");
 	assert.equal(mapOpenCodeProvider("zhipu"), "zai");
 	assert.equal(mapOpenCodeProvider("opencode-go"), "opencode-go");
+	assert.equal(mapOpenCodeProvider("opencode"), "opencode-go");
 	assert.equal(mapOpenCodeProvider("opencode-zen"), "opencode-go");
 });
 

@@ -240,7 +240,7 @@ Off by default. When enabled, `/usage` folds other local agent logs into the sam
 | `claudeCode` | `~/.claude/projects`, `~/.config/claude/projects` (`CLAUDE_CONFIG_DIR` if set) | `anthropic` |
 | `codexCli` | `~/.codex/sessions` (`CODEX_HOME` if set) | `openai-codex` |
 | `grokBuild` | `~/.grok/sessions` (`GROK_HOME` if set); only `updates.jsonl` | `xai` |
-| `opencodeGo` (alias `opencode`) | `~/.local/share/opencode` (`OPENCODE_DATA_DIR` / `XDG_DATA_HOME`); only `storage/message/msg_*.json` | `opencode-go`, or folded (`zai`, `anthropic`, …) |
+| `opencodeGo` (alias `opencode`) | `~/.local/share/opencode` (`OPENCODE_DATA_DIR` / `XDG_DATA_HOME`); only `storage/message/msg_*.json` | `opencode-go` (Pi `opencode` too); GLM still folds into `zai` |
 
 ```json
 {
@@ -267,6 +267,7 @@ Mapping notes (correctness):
 - Claude Code / Codex CLI usually have no invoice. `/usage` fills catalog USD (Pi's per-million rates) so cost graphs/tables include them. Grok `costUsdTicks` still wins when present.
 - Extra-source cost estimates rebuild the on-disk cache once (v6).
 - OpenCode Go: `muse-spark-1.3-contributor` uses the Pi catalog ($0.10 / $0.20 / $0.002 per M). `*-contributor-free` stays $0. GLM via `zai-coding-plan` folds into `zai`. `storage/part` is never scanned.
+- Graph: `opencode-go` and `muse-spark-*` are first-class series (never folded into `other`, never hidden by default). Extra sources themselves stay **off** until `usage-extension.sources.*` is true.
 
 The first open after enabling a source parses those files once, then the same size+mtime cache applies.
 

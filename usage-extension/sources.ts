@@ -599,8 +599,7 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 
 export function mapOpenCodeProvider(providerID: string): string {
 	const id = providerID.toLowerCase();
-	if (!id) return "opencode";
-	if (id === "opencode-go" || id === "opencode-zen" || id === "zen") return "opencode-go";
+	if (!id || id === "opencode" || id === "opencode-go" || id === "opencode-zen" || id === "zen") return "opencode-go";
 	if (id.includes("zai") || id.includes("zhipu")) return "zai";
 	if (id.includes("anthropic") || id === "claude") return "anthropic";
 	if (id.includes("codex")) return "openai-codex";

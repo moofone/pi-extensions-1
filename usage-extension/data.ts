@@ -1621,6 +1621,8 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 		const meta: MessageMeta[] = [];
 		let previousAssistant: SessionMessage | null = null;
 		for (const m of rawMsgs) {
+			// Fold Pi `opencode` into the same first-class series as OpenCode Go.
+			if (m.provider === "opencode" || m.provider === "opencode-zen") m.provider = "opencode-go";
 			// Auxiliary usage is interleaved with conversation entries, but it must
 			// not become the "previous message" for cache-miss classification.
 			const prev = m.source === "assistant" ? previousAssistant : null;
