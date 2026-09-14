@@ -12,6 +12,7 @@ import {
 	collectOpenCodeMessageFiles,
 	disabledUsageSources,
 	estimateUsd,
+	canonicalProvider,
 	grokBuildTokenAmount,
 	mapOpenCodeProvider,
 	openCodeTokenAmount,
@@ -584,7 +585,7 @@ test("collectUsageData merges Grok Build CLI into xai without reading chat_histo
 	const { root, sessionsDir, cachePath } = fixture(t);
 	writeFileSync(
 		join(sessionsDir, "pi.jsonl"),
-		[piSession("s-pi", TS_TODAY), piAssistant({ ts: TS_TODAY, provider: "xai", model: "grok-4.6", cost: 0.2, input: 4, output: 1 })].join("\n") + "\n",
+		[piSession("s-pi", TS_TODAY), piAssistant({ ts: TS_TODAY, provider: "grok-build", model: "grok-4.6", cost: 0.2, input: 4, output: 1 })].join("\n") + "\n",
 	);
 	const grokDir = join(root, "grok", "proj", "sid");
 	mkdirSync(grokDir, { recursive: true });
@@ -619,6 +620,7 @@ test("collectUsageData merges Grok Build CLI into xai without reading chat_histo
 		now: NOW,
 		sources: sourcesFor({ grokBuild: { enabled: true, roots: [join(root, "grok")] } }),
 	});
+	assert.equal(data.allTime.providers.has("grok-build"), false);
 	const xai = data.allTime.providers.get("xai");
 	assert.equal(xai.messages, 2);
 	assert.ok(xai.models.get("grok-4.6"));
@@ -710,6 +712,13 @@ function ocAssistant({
 		...(error ? { error } : {}),
 	};
 }
+
+test("canonicalProvider folds grok-build and Pi opencode into first-class vendors", () => {
+	assert.equal(canonicalProvider("grok-build"), "xai");
+	assert.equal(canonicalProvider("xai-grok-build"), "xai");
+	assert.equal(canonicalProvider("xai"), "xai");
+	assert.equal(canonicalProvider("opencode"), "opencode-go");
+});
 
 test("mapOpenCodeProvider folds Z.AI plans into zai and keeps opencode-go", () => {
 	assert.equal(mapOpenCodeProvider("zai-coding-plan"), "zai");

@@ -590,7 +590,9 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 }
 
 export function canonicalProvider(provider: string): string {
-	return provider === "opencode" || provider === "opencode-zen" ? "opencode-go" : provider;
+	if (provider === "opencode" || provider === "opencode-zen") return "opencode-go";
+	if (provider === "grok-build" || provider === "xai-grok-build") return "xai";
+	return provider;
 }
 
 export function mapOpenCodeProvider(providerID: string): string {

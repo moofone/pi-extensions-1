@@ -239,7 +239,7 @@ Off by default. When enabled, `/usage` folds other local agent logs into the sam
 | --- | --- | --- |
 | `claudeCode` | `~/.claude/projects`, `~/.config/claude/projects` (`CLAUDE_CONFIG_DIR` if set) | `anthropic` |
 | `codexCli` | `~/.codex/sessions` (`CODEX_HOME` if set) | `openai-codex` |
-| `grokBuild` | `~/.grok/sessions` (`GROK_HOME` if set); only `updates.jsonl` | `xai` |
+| `grokBuild` | `~/.grok/sessions` (`GROK_HOME` if set); only `updates.jsonl` | `xai` (Pi `grok-build` too) |
 | `opencodeGo` (alias `opencode`) | `~/.local/share/opencode` (`OPENCODE_DATA_DIR` / `XDG_DATA_HOME`); only `storage/message/msg_*.json` | `opencode-go` (Pi `opencode` too); GLM still folds into `zai` |
 
 ```json
