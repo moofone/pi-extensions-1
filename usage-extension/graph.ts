@@ -39,11 +39,10 @@ export const GROUP_LABELS: Record<GraphGroupBy, string> = {
 /** Series beyond this cap are merged into a single "other" series. */
 export const MAX_GROUP_SERIES = 6;
 
-/** Always their own legend/plot series; never folded into "other". */
-export const FIRST_CLASS_PROVIDERS = new Set(["opencode-go"]);
-export const FIRST_CLASS_MODEL_PREFIXES = ["muse-spark-"];
+const FIRST_CLASS_PROVIDERS = new Set(["opencode-go"]);
+const FIRST_CLASS_MODEL_PREFIXES = ["muse-spark-"];
 
-export function isFirstClassGroup(groupBy: GraphGroupBy, key: string): boolean {
+function isFirstClassGroup(groupBy: GraphGroupBy, key: string): boolean {
 	if (groupBy === "provider") return FIRST_CLASS_PROVIDERS.has(key);
 	if (groupBy === "model") return FIRST_CLASS_MODEL_PREFIXES.some((prefix) => key.startsWith(prefix));
 	return false;

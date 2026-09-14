@@ -192,6 +192,17 @@ test("estimateUsd uses Pi catalog rates per million tokens", () => {
 		1,
 	);
 	assert.equal(
+		estimateUsd("anthropic", "claude-opus-4-8", {
+			cost: 0,
+			input: 1_000_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			reasoning: 0,
+		}),
+		5,
+	);
+	assert.equal(
 		estimateUsd("xai", "grok-4.6-build", {
 			cost: 0,
 			input: 1_000_000,

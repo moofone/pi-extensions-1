@@ -63,15 +63,6 @@ export function disabledUsageSources(): ResolvedUsageSources {
 	};
 }
 
-export function anyExtraSourceEnabled(sources: ResolvedUsageSources): boolean {
-	return (
-		sources.claudeCode.enabled ||
-		sources.codexCli.enabled ||
-		sources.grokBuild.enabled ||
-		sources.opencodeGo.enabled
-	);
-}
-
 const GROK_COST_TICKS_PER_USD = 10_000_000_000;
 const PARSE_YIELD_EVERY_LINES = 2000;
 const NEWLINE = 0x0a;
@@ -117,7 +108,7 @@ function coercePaths(setting: UsageSourceSetting | undefined): string[] {
 	return paths;
 }
 
-export function defaultClaudeCodeRoots(home: string, env: NodeJS.ProcessEnv): string[] {
+function defaultClaudeCodeRoots(home: string, env: NodeJS.ProcessEnv): string[] {
 	const fromEnv = (env.CLAUDE_CONFIG_DIR ?? "").trim();
 	if (fromEnv) {
 		return splitPathList(fromEnv).map((root) => join(expandHome(root, home), "projects"));
@@ -125,19 +116,19 @@ export function defaultClaudeCodeRoots(home: string, env: NodeJS.ProcessEnv): st
 	return [join(home, ".claude", "projects"), join(home, ".config", "claude", "projects")];
 }
 
-export function defaultCodexCliRoots(home: string, env: NodeJS.ProcessEnv): string[] {
+function defaultCodexCliRoots(home: string, env: NodeJS.ProcessEnv): string[] {
 	const fromEnv = (env.CODEX_HOME ?? "").trim();
 	if (fromEnv) return [join(expandHome(fromEnv, home), "sessions")];
 	return [join(home, ".codex", "sessions")];
 }
 
-export function defaultGrokBuildRoots(home: string, env: NodeJS.ProcessEnv): string[] {
+function defaultGrokBuildRoots(home: string, env: NodeJS.ProcessEnv): string[] {
 	const fromEnv = (env.GROK_HOME ?? "").trim();
 	if (fromEnv) return [join(expandHome(fromEnv, home), "sessions")];
 	return [join(home, ".grok", "sessions")];
 }
 
-export function defaultOpenCodeGoRoots(home: string, env: NodeJS.ProcessEnv): string[] {
+function defaultOpenCodeGoRoots(home: string, env: NodeJS.ProcessEnv): string[] {
 	const fromEnv = (env.OPENCODE_DATA_DIR ?? "").trim();
 	if (fromEnv) return splitPathList(fromEnv).map((root) => expandHome(root, home));
 	const xdg = (env.XDG_DATA_HOME ?? "").trim();
@@ -195,11 +186,10 @@ export async function collectNamedFiles(dir: string, fileName: string, signal?: 
 	return files;
 }
 
-/** Resolve OpenCode root to `storage/message` so `storage/part` is never walked. */
-export function openCodeMessageRoot(root: string): string {
-	const normalized = root.replace(/[/\\]+$/, "");
-	if (normalized.endsWith("/storage/message") || normalized.endsWith("\\storage\\message")) return normalized;
-	if (normalized.endsWith("/storage") || normalized.endsWith("\\storage")) return join(normalized, "message");
+function openCodeMessageRoot(root: string): string {
+	const normalized = root.replace(/\/+$/, "");
+	if (normalized.endsWith("/storage/message")) return normalized;
+	if (normalized.endsWith("/storage")) return join(normalized, "message");
 	return join(normalized, "storage", "message");
 }
 
@@ -311,8 +301,8 @@ export function grokBuildTokenAmount(usage: Record<string, unknown>): UsageAmoun
 	});
 }
 
-/** USD per million tokens, copied from Pi's model catalog. Used only when a log has no invoice. */
-export interface TokenRates {
+/** USD per million tokens, from Pi's model catalog. Used only when a log has no invoice. */
+interface TokenRates {
 	input: number;
 	output: number;
 	cacheRead: number;
@@ -321,13 +311,9 @@ export interface TokenRates {
 
 const MODEL_RATES: Record<string, TokenRates> = {
 	"claude-opus-5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-	"claude-opus-4-8": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-	"claude-opus-4-7": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-	"claude-opus-4-6": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
-	"claude-opus-4-5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"claude-opus-4": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 	"claude-sonnet-5": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
-	"claude-sonnet-4-6": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
-	"claude-sonnet-4-5": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+	"claude-sonnet-4": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
 	"claude-fable-5-1": { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
 	"claude-fable-5": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
 	"claude-haiku-4-5": { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
@@ -338,15 +324,13 @@ const MODEL_RATES: Record<string, TokenRates> = {
 	"grok-4.6": { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
 	"grok-4.5": { input: 2, output: 6, cacheRead: 0.3, cacheWrite: 0 },
 	"glm-4.7": { input: 0.6, output: 2.2, cacheRead: 0.11, cacheWrite: 0 },
-	"glm-5": { input: 1, output: 3.2, cacheRead: 0.2, cacheWrite: 0 },
-	"glm-5.1": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
-	"glm-5.2": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
-	"glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
 	"glm-5.3-flash": { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 },
+	"glm-5.3": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	"glm-5.2": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	"glm-5.1": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
+	"glm-5": { input: 1, output: 3.2, cacheRead: 0.2, cacheWrite: 0 },
 	"muse-spark-1.3-contributor-free": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	"muse-spark-1.2-contributor-free": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	"opencode-go/muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
-	"opencode-go/muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
 	"muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
 	"muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
 	"muse-spark-1.3": { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
@@ -359,12 +343,11 @@ const PROVIDER_RATES: Record<string, TokenRates> = {
 	xai: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
 	zai: { input: 0.6, output: 2.2, cacheRead: 0.11, cacheWrite: 0 },
 	"opencode-go": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
-	opencode: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 };
 
 const ZERO_RATES: TokenRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
-export function ratesFor(provider: string, model: string): TokenRates {
+function ratesFor(provider: string, model: string): TokenRates {
 	const stripped = model.replace(/-build$/, "");
 	for (const id of [`${provider}/${model}`, model, `${provider}/${stripped}`, stripped]) {
 		const exact = MODEL_RATES[id];
@@ -393,7 +376,7 @@ export function estimateUsd(provider: string, model: string, amount: UsageAmount
 	);
 }
 
-export function withPricedCost(provider: string, model: string, amount: UsageAmount): UsageAmount {
+function withPricedCost(provider: string, model: string, amount: UsageAmount): UsageAmount {
 	if (amount.cost !== 0) return amount;
 	const cost = estimateUsd(provider, model, amount);
 	return cost === 0 ? amount : { ...amount, cost };
@@ -409,9 +392,12 @@ const PATTERN_CODEX_USAGE = Buffer.from('"type":"token_usage_record"');
 const PATTERN_CODEX_USAGE_SPACED = Buffer.from('"type": "token_usage_record"');
 const PATTERN_GROK_TURN = Buffer.from("turn_completed");
 
-function lineHas(line: Buffer, compact: Buffer, spaced: Buffer): boolean {
+function lineHas(line: Buffer, ...needles: Buffer[]): boolean {
 	const head = line.length > 2048 ? line.subarray(0, 2048) : line;
-	return head.includes(compact) || head.includes(spaced);
+	for (const needle of needles) {
+		if (head.includes(needle)) return true;
+	}
+	return false;
 }
 
 async function forEachJsonLine(
@@ -494,9 +480,15 @@ export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal):
 	await forEachJsonLine(
 		buffer,
 		(line) =>
-			lineHas(line, PATTERN_CODEX_META, PATTERN_CODEX_META_SPACED) ||
-			lineHas(line, PATTERN_CODEX_TURN, PATTERN_CODEX_TURN_SPACED) ||
-			lineHas(line, PATTERN_CODEX_USAGE, PATTERN_CODEX_USAGE_SPACED),
+			lineHas(
+				line,
+				PATTERN_CODEX_META,
+				PATTERN_CODEX_META_SPACED,
+				PATTERN_CODEX_TURN,
+				PATTERN_CODEX_TURN_SPACED,
+				PATTERN_CODEX_USAGE,
+				PATTERN_CODEX_USAGE_SPACED,
+			),
 		(entry) => {
 			const payload = asRecord(entry.payload) ?? {};
 			if (entry.type === "session_meta") {
@@ -555,7 +547,7 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 
 	await forEachJsonLine(
 		buffer,
-		(line) => line.includes(PATTERN_GROK_TURN),
+		(line) => lineHas(line, PATTERN_GROK_TURN),
 		(entry) => {
 			const params = asRecord(entry.params);
 			const update = asRecord(params?.update);
@@ -595,6 +587,10 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 	);
 
 	return { sessionId, cwd, messages, toolUsages: [] };
+}
+
+export function canonicalProvider(provider: string): string {
+	return provider === "opencode" || provider === "opencode-zen" ? "opencode-go" : provider;
 }
 
 export function mapOpenCodeProvider(providerID: string): string {

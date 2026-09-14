@@ -11,23 +11,20 @@
  *   re-parses files that changed since the last run.
  */
 
-import { readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import {
-	anyExtraSourceEnabled,
+	canonicalProvider,
 	collectJsonlFiles,
 	collectNamedFiles,
 	collectOpenCodeMessageFiles,
 	disabledUsageSources,
 	fallbackSessionId,
-	parseClaudeCodeBuffer,
-	parseCodexCliBuffer,
-	parseGrokBuildBuffer,
-	parseOpenCodeGoBuffer,
+	parseUsageFileBuffer,
 } from "./sources.ts";
-import type { ResolvedUsageSources, UsageFileKind } from "./sources.ts";
+import type { ExtraSourceKind, ResolvedUsageSources, UsageFileKind } from "./sources.ts";
 
 // =============================================================================
 // Types
@@ -266,30 +263,6 @@ export function getDefaultCachePath(): string {
 // =============================================================================
 // Session file discovery
 // =============================================================================
-
-async function collectSessionFilesRecursively(dir: string, files: string[], signal?: AbortSignal): Promise<void> {
-	try {
-		const entries = await readdir(dir, { withFileTypes: true });
-		for (const entry of entries) {
-			if (signal?.aborted) return;
-			const entryPath = join(dir, entry.name);
-			if (entry.isDirectory()) {
-				await collectSessionFilesRecursively(entryPath, files, signal);
-			} else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-				files.push(entryPath);
-			}
-		}
-	} catch {
-		// Skip directories we can't read
-	}
-}
-
-async function getAllSessionFiles(sessionsDir: string, signal?: AbortSignal): Promise<string[]> {
-	const files: string[] = [];
-	await collectSessionFilesRecursively(sessionsDir, files, signal);
-	files.sort();
-	return files;
-}
 
 // =============================================================================
 // Session file parsing
@@ -1429,32 +1402,24 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 			filePaths.push(filePath);
 		}
 	};
-	addFiles(await getAllSessionFiles(sessionsDir, signal), "pi");
+	addFiles(await collectJsonlFiles(sessionsDir, signal), "pi");
 	if (signal?.aborted) return null;
-	if (anyExtraSourceEnabled(sources)) {
-		if (sources.claudeCode.enabled) {
-			for (const root of sources.claudeCode.roots) {
-				addFiles(await collectJsonlFiles(root, signal), "claude-code");
-				if (signal?.aborted) return null;
-			}
-		}
-		if (sources.codexCli.enabled) {
-			for (const root of sources.codexCli.roots) {
-				addFiles(await collectJsonlFiles(root, signal), "codex-cli");
-				if (signal?.aborted) return null;
-			}
-		}
-		if (sources.grokBuild.enabled) {
-			for (const root of sources.grokBuild.roots) {
-				addFiles(await collectNamedFiles(root, "updates.jsonl", signal), "grok-build");
-				if (signal?.aborted) return null;
-			}
-		}
-		if (sources.opencodeGo.enabled) {
-			for (const root of sources.opencodeGo.roots) {
-				addFiles(await collectOpenCodeMessageFiles(root, signal), "opencode-go");
-				if (signal?.aborted) return null;
-			}
+	const extraScans: Array<{
+		enabled: boolean;
+		roots: string[];
+		kind: ExtraSourceKind;
+		list: (root: string, signal?: AbortSignal) => Promise<string[]>;
+	}> = [
+		{ ...sources.claudeCode, kind: "claude-code", list: collectJsonlFiles },
+		{ ...sources.codexCli, kind: "codex-cli", list: collectJsonlFiles },
+		{ ...sources.grokBuild, kind: "grok-build", list: (root, sig) => collectNamedFiles(root, "updates.jsonl", sig) },
+		{ ...sources.opencodeGo, kind: "opencode-go", list: collectOpenCodeMessageFiles },
+	];
+	for (const scan of extraScans) {
+		if (!scan.enabled) continue;
+		for (const root of scan.roots) {
+			addFiles(await scan.list(root, signal), scan.kind);
+			if (signal?.aborted) return null;
 		}
 	}
 
@@ -1546,16 +1511,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 						continue; // File vanished — skip it.
 					}
 					const kind = fileKinds.get(filePath) ?? "pi";
-					const parsed =
-						kind === "claude-code"
-							? await parseClaudeCodeBuffer(buffer, signal)
-							: kind === "codex-cli"
-								? await parseCodexCliBuffer(buffer, signal)
-								: kind === "grok-build"
-									? await parseGrokBuildBuffer(buffer, signal)
-									: kind === "opencode-go"
-										? await parseOpenCodeGoBuffer(buffer, signal)
-										: await parseSessionBuffer(buffer, signal);
+					const parsed = await parseUsageFileBuffer(kind, buffer, signal, parseSessionBuffer);
 					if (signal?.aborted) return; // Never cache a partial parse.
 					parsed.sessionId = fallbackSessionId(kind, filePath, parsed.sessionId);
 					current.set(filePath, { size: st.size, mtimeMs: st.mtimeMs, parsed });
@@ -1621,8 +1577,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 		const meta: MessageMeta[] = [];
 		let previousAssistant: SessionMessage | null = null;
 		for (const m of rawMsgs) {
-			// Fold Pi `opencode` into the same first-class series as OpenCode Go.
-			if (m.provider === "opencode" || m.provider === "opencode-zen") m.provider = "opencode-go";
+			m.provider = canonicalProvider(m.provider);
 			// Auxiliary usage is interleaved with conversation entries, but it must
 			// not become the "previous message" for cache-miss classification.
 			const prev = m.source === "assistant" ? previousAssistant : null;
