@@ -13,7 +13,7 @@ import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-wor
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Container, Spacer, matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-import { collectUsageData, getAgentDir, TAB_ORDER } from "./data";
+import { collectUsageData, compareNamedSeries, getAgentDir, TAB_ORDER } from "./data";
 import type { CollectProgress } from "./data";
 import { parseUsageSourcesSetting } from "./sources";
 import type { ResolvedUsageSources } from "./sources";
@@ -312,7 +312,7 @@ class UsageComponent {
 	private updateProviderOrder(): void {
 		const stats = this.data[this.activeTab];
 		this.providerOrder = Array.from(stats.providers.entries())
-			.sort((a, b) => b[1].cost - a[1].cost)
+			.sort((a, b) => compareNamedSeries(a[0], a[1].cost, b[0], b[1].cost))
 			.map(([name]) => name);
 		this.clampTableSelection();
 	}

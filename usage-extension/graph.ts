@@ -10,7 +10,7 @@
 // Explicit .ts extension so plain `node --test` (type stripping) can resolve
 // this module too; pi's extension loader accepts it as well.
 import type { HourlyCell, HourlyKey, PeriodBounds, TabName } from "./data.ts";
-import { splitHourlyKey } from "./data.ts";
+import { compareNamedSeries, splitHourlyKey } from "./data.ts";
 
 // =============================================================================
 // Options and model types
@@ -197,7 +197,7 @@ export function buildGraphModel(
 		...ranked.filter(([key]) => isFirstClassGroup(options.groupBy, key)).map(([key]) => key),
 		...rest.slice(0, MAX_GROUP_SERIES).map(([key]) => key),
 	]);
-	const kept = ranked.filter(([key]) => keptKeys.has(key));
+	const kept = ranked.filter(([key]) => keptKeys.has(key)).sort((a, b) => compareNamedSeries(a[0], a[1], b[0], b[1]));
 	const merged = ranked.filter(([key]) => !keptKeys.has(key));
 
 	const hidden = options.hidden ?? new Set<string>();

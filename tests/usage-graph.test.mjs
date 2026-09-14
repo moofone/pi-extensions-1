@@ -159,9 +159,10 @@ test("buildGraphModel caps series and merges the tail into other", () => {
 
 test("buildGraphModel keeps opencode-go and muse-spark first-class instead of folding into other", () => {
 	const entries = [];
-	for (let i = 0; i < MAX_GROUP_SERIES; i++) {
+	for (let i = 0; i < MAX_GROUP_SERIES - 1; i++) {
 		entries.push([TODAY + HOUR, `prov${i}`, "m", "", cell({ cost: 100 - i })]);
 	}
+	entries.push([TODAY + HOUR, "Tools", "summaries", "", cell({ cost: 50 })]);
 	entries.push([TODAY + HOUR, "opencode-go", "muse-spark-1.3-contributor", "", cell({ cost: 3 })]);
 	entries.push([TODAY + HOUR, "tiny", "m", "", cell({ cost: 1 })]);
 
@@ -175,6 +176,9 @@ test("buildGraphModel keeps opencode-go and muse-spark first-class instead of fo
 	const providerLabels = byProvider.series.map((s) => s.label);
 	assert.ok(providerLabels.includes("opencode-go"));
 	assert.equal(byProvider.series.find((s) => s.key === "opencode-go").hidden, false);
+	const goIdx = providerLabels.indexOf("opencode-go");
+	const toolsIdx = providerLabels.indexOf("Tools");
+	assert.ok(goIdx > 0 && toolsIdx > goIdx, "opencode-go must sit above Tools");
 	const other = byProvider.series.find((s) => s.key === OTHER_SERIES_KEY);
 	assert.equal(other.label, "other (1)");
 	assert.equal(other.total, 1);

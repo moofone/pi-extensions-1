@@ -183,6 +183,14 @@ export type UsageSource = "assistant" | "auxiliary";
 
 /** Pi's own label for usage that cannot be attributed to a provider/model. */
 export const AUXILIARY_PROVIDER = "Tools";
+
+/** Named series: real providers by value desc, synthetic Tools last. */
+export function compareNamedSeries(aName: string, aValue: number, bName: string, bValue: number): number {
+	const aAux = aName === AUXILIARY_PROVIDER ? 1 : 0;
+	const bAux = bName === AUXILIARY_PROVIDER ? 1 : 0;
+	if (aAux !== bAux) return aAux - bAux;
+	return bValue - aValue;
+}
 export const AUXILIARY_MODEL = "summaries";
 export const AUXILIARY_THINKING_LEVEL = "Tools/summaries";
 
