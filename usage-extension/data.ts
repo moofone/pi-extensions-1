@@ -757,7 +757,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 // On-disk cache
 // =============================================================================
 
-const CACHE_VERSION = 5;
+const CACHE_VERSION = 6;
 
 type CachedMessageTuple = [
 	providerIdx: number,

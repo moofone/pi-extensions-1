@@ -743,7 +743,7 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 
 	// Cache was rebuilt.
 	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-	assert.equal(cacheJson.version, 5);
+	assert.equal(cacheJson.version, 6);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -853,10 +853,14 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
 	writeFileSync(cachePath, JSON.stringify({ version: 4, names: [], files: {} }));
 	assert.equal((await loadUsageCache(cachePath)).size, 0);
 
+	// v5 caches predate extra-source estimated USD.
+	writeFileSync(cachePath, JSON.stringify({ version: 5, names: [], files: {} }));
+	assert.equal((await loadUsageCache(cachePath)).size, 0);
+
 	writeFileSync(
 		cachePath,
 		JSON.stringify({
-			version: 5,
+			version: 6,
 			names: ["p", "m", "high", "entry-a"],
 			files: {
 				"/ok.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3]], toolUsages: [] },

@@ -271,6 +271,77 @@ export function grokBuildTokenAmount(usage: Record<string, unknown>): UsageAmoun
 	});
 }
 
+/** USD per million tokens, copied from Pi's model catalog. Used only when a log has no invoice. */
+export interface TokenRates {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+const MODEL_RATES: Record<string, TokenRates> = {
+	"claude-opus-5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"claude-opus-4-8": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"claude-opus-4-7": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"claude-opus-4-6": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"claude-opus-4-5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"claude-sonnet-5": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
+	"claude-sonnet-4-6": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+	"claude-sonnet-4-5": { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+	"claude-fable-5-1": { input: 10, output: 50, cacheRead: 0.25, cacheWrite: 12.5 },
+	"claude-fable-5": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+	"claude-haiku-4-5": { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 },
+	"gpt-6-astra": { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+	"gpt-5.6-luna": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+	"gpt-5.6-sol": { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+	"gpt-5.6-terra": { input: 2, output: 12, cacheRead: 0.2, cacheWrite: 2.5 },
+	"grok-4.6": { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+	"grok-4.5": { input: 2, output: 6, cacheRead: 0.3, cacheWrite: 0 },
+};
+
+const PROVIDER_RATES: Record<string, TokenRates> = {
+	anthropic: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
+	"openai-codex": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
+	xai: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
+};
+
+const ZERO_RATES: TokenRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+
+export function ratesFor(provider: string, model: string): TokenRates {
+	const stripped = model.replace(/-build$/, "");
+	for (const id of [model, stripped]) {
+		const exact = MODEL_RATES[id];
+		if (exact) return exact;
+	}
+	let best: TokenRates | undefined;
+	let bestLen = 0;
+	for (const [id, rates] of Object.entries(MODEL_RATES)) {
+		if ((model.startsWith(id) || stripped.startsWith(id)) && id.length > bestLen) {
+			best = rates;
+			bestLen = id.length;
+		}
+	}
+	return best ?? PROVIDER_RATES[provider] ?? ZERO_RATES;
+}
+
+/** Catalog estimate in USD. Extra-source logs often store tokens with no invoice. */
+export function estimateUsd(provider: string, model: string, amount: UsageAmount): number {
+	const rates = ratesFor(provider, model);
+	return (
+		(amount.input * rates.input +
+			amount.output * rates.output +
+			amount.cacheRead * rates.cacheRead +
+			amount.cacheWrite * rates.cacheWrite) /
+		1_000_000
+	);
+}
+
+export function withPricedCost(provider: string, model: string, amount: UsageAmount): UsageAmount {
+	if (amount.cost !== 0) return amount;
+	const cost = estimateUsd(provider, model, amount);
+	return cost === 0 ? amount : { ...amount, cost };
+}
+
 const PATTERN_CC_ASSISTANT_COMPACT = Buffer.from('"type":"assistant"');
 const PATTERN_CC_ASSISTANT_SPACED = Buffer.from('"type": "assistant"');
 const PATTERN_CODEX_META = Buffer.from('"type":"session_meta"');
@@ -346,7 +417,7 @@ export async function parseClaudeCodeBuffer(buffer: Buffer, signal?: AbortSignal
 					thinkingLevel,
 					sourceId,
 					timestamp: toMillis(entry.timestamp),
-					...amount,
+					...withPricedCost("anthropic", model, amount),
 				}),
 			);
 		},
@@ -412,7 +483,7 @@ export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal):
 				thinkingLevel: ctx.effort,
 				sourceId: record.sourceId,
 				timestamp: record.timestamp,
-				...amount,
+				...withPricedCost("openai-codex", ctx.model, amount),
 			}),
 		);
 	}
@@ -458,7 +529,7 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 						thinkingLevel: "",
 						sourceId: promptId ? `${promptId}:${row.model}` : row.model,
 						timestamp,
-						...amount,
+						...withPricedCost("xai", row.model, amount),
 					}),
 				);
 			}

@@ -10,6 +10,7 @@ import {
 	codexCliTokenAmount,
 	collectNamedFiles,
 	disabledUsageSources,
+	estimateUsd,
 	grokBuildTokenAmount,
 	parseClaudeCodeBuffer,
 	parseCodexCliBuffer,
@@ -146,6 +147,42 @@ test("codexCliTokenAmount clamps when cached exceeds input", () => {
 	});
 });
 
+test("estimateUsd uses Pi catalog rates per million tokens", () => {
+	assert.equal(
+		estimateUsd("anthropic", "claude-opus-5", {
+			cost: 0,
+			input: 2,
+			output: 294,
+			cacheRead: 22725,
+			cacheWrite: 15836,
+			reasoning: 0,
+		}),
+		(2 * 5 + 294 * 25 + 22725 * 0.5 + 15836 * 6.25) / 1_000_000,
+	);
+	assert.equal(
+		estimateUsd("anthropic", "claude-haiku-4-5-20251001", {
+			cost: 0,
+			input: 1_000_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			reasoning: 0,
+		}),
+		1,
+	);
+	assert.equal(
+		estimateUsd("xai", "grok-4.6-build", {
+			cost: 0,
+			input: 1_000_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			reasoning: 0,
+		}),
+		2,
+	);
+});
+
 test("grokBuildTokenAmount splits inclusive inputTokens and converts costUsdTicks", () => {
 	assert.deepEqual(
 		grokBuildTokenAmount({
@@ -194,6 +231,17 @@ test("parseClaudeCodeBuffer counts assistant usage and skips user/side-channel l
 	assert.equal(parsed.messages[0].input, 2);
 	assert.equal(parsed.messages[0].cacheWrite, 10);
 	assert.equal(parsed.messages[0].cacheRead, 20);
+	assert.equal(
+		parsed.messages[0].cost,
+		estimateUsd("anthropic", "claude-opus-5", {
+			cost: 0,
+			input: 2,
+			output: 3,
+			cacheRead: 20,
+			cacheWrite: 10,
+			reasoning: 0,
+		}),
+	);
 	assert.equal(parsed.messages[0].sourceId, "a1");
 	assert.equal(parsed.toolUsages.length, 0);
 });
@@ -492,7 +540,7 @@ test("collectUsageData merges Claude Code into anthropic and Codex CLI into open
 	assert.equal(anthropic.models.get("claude-opus-5").tokens.input, 13);
 	assert.equal(anthropic.models.get("claude-opus-5").tokens.cacheWrite, 8);
 	assert.equal(anthropic.models.get("claude-opus-5").tokens.cacheRead, 30);
-	assert.equal(anthropic.cost, 1);
+	assert.ok(anthropic.cost > 1, "Claude Code tokens must add estimated USD on top of Pi invoice");
 
 	const codex = data.allTime.providers.get("openai-codex");
 	assert.equal(codex.messages, 2);

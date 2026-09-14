@@ -5,6 +5,7 @@
 ### Added
 - Optional extra sources for Claude Code, Codex CLI, and Grok Build CLI session logs. Off by default; enable under `usage-extension.sources` in `settings.json`. Extra trees are not walked unless enabled.
 - Token mapping: Claude Code uncached `input_tokens` + cache create/read; Codex/Grok split inclusive input vs cache read; Grok `costUsdTicks` (1e-10 USD); Codex counts only `token_usage_record.usage`.
+- When an extra-source log has tokens but no invoice, estimate USD from Pi catalog rates so cost graphs/tables/insights include Claude Code and Codex CLI. Cache format **v6** (one rebuild).
 
 ## [0.9.4] - 2026-07-22
 

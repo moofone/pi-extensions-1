@@ -262,7 +262,8 @@ Mapping notes (correctness):
 - Codex `turn_token_usage` / `thread_token_usage` are ignored (cumulatives). Only each `token_usage_record.usage` is counted.
 - Grok only counts `sessionUpdate: "turn_completed"`. Cost uses `costUsdTicks` (1e-10 USD). In-progress turns are omitted.
 - Model ids are kept as recorded (`grok-4.6` vs `grok-4.6-build` stay distinct rows).
-- Claude Code / Codex CLI usually have no persisted USD; their cost column stays `—` unless the log includes it. Tokens still merge.
+- Claude Code / Codex CLI usually have no invoice. `/usage` fills catalog USD (Pi's per-million rates) so cost graphs/tables include them. Grok `costUsdTicks` still wins when present.
+- Extra-source cost estimates rebuild the on-disk cache once (v6).
 
 The first open after enabling a source parses those files once, then the same size+mtime cache applies.
 
