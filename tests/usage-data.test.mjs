@@ -116,6 +116,11 @@ function compactionLine({ id = "compact1", ts, ...usageValues }) {
 	});
 }
 
+function contextEditLine({ id = "edit1", targetId = "m1", replacement = null, spaced = false } = {}) {
+	const entry = { type: "context_edit", id, parentId: targetId, targetId, replacement };
+	return spaced ? JSON.stringify(entry, null, 1).replaceAll("\n", "") : JSON.stringify(entry);
+}
+
 function branchSummaryLine({ id = "branch1", ts, ...usageValues }) {
 	return JSON.stringify({
 		type: "branch_summary",
@@ -172,7 +177,7 @@ test("parseSessionBuffer extracts session id and assistant messages from compact
 		cacheWrite: 40,
 		reasoning: 0,
 		timestamp: TS_TODAY,
-		afterCompaction: false,
+		afterContextChange: false,
 	});
 	assert.equal(parsed.cwd, "/tmp");
 });
@@ -202,28 +207,29 @@ test("parseSessionBuffer extracts Pi 0.81 tool and summary usage without consumi
 	assert.equal(parsed.toolUsages[0].reportedUsage.cost, 2);
 	assert.equal(parsed.toolUsages[0].reportedUsage.reasoning, 1);
 	assert.equal(parsed.toolUsages[0].timestamp, TS_TODAY + 1000);
-	assert.equal(parsed.messages[3].afterCompaction, true, "auxiliary entries must not clear the pending compaction marker");
+	assert.equal(parsed.messages[3].afterContextChange, true, "auxiliary entries must not clear the pending context change");
 });
 
-test("parseSessionBuffer flags the first assistant message after a compaction entry", async () => {
-	const compaction = (spaced) =>
-		spaced
-			? '{"type": "compaction", "id": "c1", "summary": "..."}'
-			: '{"type":"compaction","id":"c2","summary":"..."}';
+test("parseSessionBuffer flags the first assistant message after compact and spaced context changes", async () => {
 	const content = [
 		sessionLine("s1", TS_TODAY),
 		assistantLine({ ts: TS_TODAY, cost: 1 }),
-		compaction(false),
+		'{"type":"compaction","id":"c1","summary":"..."}',
 		assistantLine({ ts: TS_TODAY + 1000, cost: 2 }),
 		assistantLine({ ts: TS_TODAY + 2000, cost: 3 }),
-		compaction(true),
+		'{"type": "compaction", "id": "c2", "summary": "..."}',
 		assistantLine({ ts: TS_TODAY + 3000, cost: 4 }),
+		contextEditLine(),
+		assistantLine({ ts: TS_TODAY + 4000, cost: 5 }),
+		assistantLine({ ts: TS_TODAY + 5000, cost: 6 }),
+		contextEditLine({ id: "edit2", spaced: true }),
+		assistantLine({ ts: TS_TODAY + 6000, cost: 7 }),
 	].join("\n");
 
 	const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
 	assert.deepEqual(
-		parsed.messages.map((m) => m.afterCompaction),
-		[false, true, false, true]
+		parsed.messages.map((message) => message.afterContextChange),
+		[false, true, false, true, true, false, true],
 	);
 });
 
@@ -743,7 +749,7 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 
 	// Cache was rebuilt.
 	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-	assert.equal(cacheJson.version, 5);
+	assert.equal(cacheJson.version, 6);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -774,8 +780,8 @@ test("saveUsageCache/loadUsageCache round-trips file states", async (t) => {
 					sessionId: "s1",
 					cwd: "/home/u/projects/x",
 					messages: [
-						{ provider: "anthropic", model: "claude-fable-5", thinkingLevel: "xhigh", source: "assistant", sourceId: "", cost: 1.5, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 7, timestamp: TS_TODAY, afterCompaction: true },
-						{ provider: "Tools", model: "summaries", thinkingLevel: "Tools/summaries", source: "auxiliary", sourceId: "summary-a", cost: 0.25, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, reasoning: 0, timestamp: TS_OLD, afterCompaction: false },
+						{ provider: "anthropic", model: "claude-fable-5", thinkingLevel: "xhigh", source: "assistant", sourceId: "", cost: 1.5, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 7, timestamp: TS_TODAY, afterContextChange: true },
+						{ provider: "Tools", model: "summaries", thinkingLevel: "Tools/summaries", source: "auxiliary", sourceId: "summary-a", cost: 0.25, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, reasoning: 0, timestamp: TS_OLD, afterContextChange: false },
 					],
 					toolUsages: [
 						{
@@ -853,10 +859,14 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
 	writeFileSync(cachePath, JSON.stringify({ version: 4, names: [], files: {} }));
 	assert.equal((await loadUsageCache(cachePath)).size, 0);
 
+	// v5 caches predate intentional context-edit boundaries.
+	writeFileSync(cachePath, JSON.stringify({ version: 5, names: [], files: {} }));
+	assert.equal((await loadUsageCache(cachePath)).size, 0);
+
 	writeFileSync(
 		cachePath,
 		JSON.stringify({
-			version: 5,
+			version: 6,
 			names: ["p", "m", "high", "entry-a"],
 			files: {
 				"/ok.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3]], toolUsages: [] },
@@ -875,7 +885,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
 	assert.deepEqual([...loaded.keys()], ["/ok.jsonl"]);
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].thinkingLevel, "high");
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].reasoning, 5);
-	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].afterCompaction, true);
+	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].afterContextChange, true);
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].source, "auxiliary");
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].sourceId, "entry-a");
 	assert.equal(loaded.get("/ok.jsonl").parsed.cwd, "/w");
@@ -925,6 +935,25 @@ test("insights classify resume vs model-switch vs prefix misses and exclude comp
 	assert.ok(sw, "model-switch alarm fires");
 	assert.equal(sw.stat, "$60.00");
 	assert.match(sw.headline, /72% of assistant-message cost/);
+});
+
+test("insights exclude intentional context-edit cache misses and resume classification afterward", async (t) => {
+	const { sessionsDir, cachePath } = fixture(t);
+	writeFileSync(
+		join(sessionsDir, "context-edit.jsonl"),
+		[
+			sessionLine("s1", TS_TODAY),
+			assistantLine({ ts: TS_TODAY, cost: 1, input: 1000, cacheRead: 100000 }),
+			contextEditLine({ replacement: { content: "Use the corrected context." } }),
+			assistantLine({ ts: TS_TODAY + 10_000, cost: 10, input: 100000, cacheRead: 0 }),
+			assistantLine({ ts: TS_TODAY + 20_000, cost: 5, input: 100000, cacheRead: 0 }),
+		].join("\n") + "\n",
+	);
+
+	const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const prefix = findInsight(data, "today", /re-sending conversations mid-session/);
+	assert.ok(prefix, "the later unexplained miss still fires");
+	assert.equal(prefix.stat, "$5.00", "the context-edit-adjacent $10 miss is intentional");
 });
 
 test("pi test providers are excluded from all stats", async (t) => {
