@@ -24,8 +24,9 @@ const BOUNDS = {
 	nowMs: NOW,
 };
 
-function cell({ messages = 1, cost = 0, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, reasoning = 0 } = {}) {
-	return { messages, cost, input, output, cacheRead, cacheWrite, reasoning };
+function cell({ messages = 1, cost = 0, estCost, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, reasoning = 0 } = {}) {
+	// estCost defaults to cost, matching paid-usage semantics.
+	return { messages, cost, estCost: estCost ?? cost, input, output, cacheRead, cacheWrite, reasoning };
 }
 
 function hourlyFrom(entries) {

@@ -16,6 +16,7 @@ import {
 	grokBuildTokenAmount,
 	mapOpenCodeProvider,
 	openCodeTokenAmount,
+	freeTierUsd,
 	parseClaudeCodeBuffer,
 	parseCodexCliBuffer,
 	parseGrokBuildBuffer,
@@ -214,6 +215,27 @@ test("estimateUsd uses Pi catalog rates per million tokens", () => {
 		}),
 		2,
 	);
+});
+
+test("estimateUsd matches zcode GLM model ids case-insensitively", () => {
+	// Session logs record the zcode-re models in Pi's registered casing; the
+	// provider folds into zai before pricing.
+	const amount = { cost: 0, input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+	assert.equal(estimateUsd("zai", "GLM-5.3-Flash", { ...amount }), 0.15);
+	assert.equal(estimateUsd("zai", "GLM-5.3", { ...amount }), 1.4);
+	assert.equal(estimateUsd("zai", "glm-5.3-flash", { ...amount }), 0.15);
+	// Unknown zcode-re model falls back to the provider's flagship rates.
+	assert.equal(estimateUsd("zcode-re", "glm-future", { ...amount }), 1.4);
+});
+
+test("freeTierUsd estimates list-priced cost for free-tier models and passes paid usage through", () => {
+	const amount = { cost: 0, input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+	// ZCode promo/subscription usage records $0 — show what tokens cost at list.
+	assert.equal(freeTierUsd("zai", "GLM-5.3-Flash", { ...amount }), 0.15);
+	assert.equal(freeTierUsd("zai", "GLM-5.3", { ...amount }), 1.4);
+	assert.equal(freeTierUsd("zai", "glm-5.3-flash", { ...amount }), 0.15);
+	// Recorded invoices are never repriced.
+	assert.equal(freeTierUsd("anthropic", "claude-opus-5", { ...amount, cost: 3.5 }), 3.5);
 });
 
 test("grokBuildTokenAmount splits inclusive inputTokens and converts costUsdTicks", () => {
@@ -713,11 +735,14 @@ function ocAssistant({
 	};
 }
 
-test("canonicalProvider folds grok-build and Pi opencode into first-class vendors", () => {
+test("canonicalProvider folds grok-build, Pi opencode, and zcode-re into first-class vendors", () => {
 	assert.equal(canonicalProvider("grok-build"), "xai");
 	assert.equal(canonicalProvider("xai-grok-build"), "xai");
 	assert.equal(canonicalProvider("xai"), "xai");
 	assert.equal(canonicalProvider("opencode"), "opencode-go");
+	// ZCode coding-plan usage reports under the zai provider row.
+	assert.equal(canonicalProvider("zcode-re"), "zai");
+	assert.equal(canonicalProvider("zai"), "zai");
 });
 
 test("mapOpenCodeProvider folds Z.AI plans into zai and keeps opencode-go", () => {

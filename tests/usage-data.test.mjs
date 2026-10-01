@@ -6,7 +6,19 @@ import test from "node:test";
 
 import { homedir } from "node:os";
 
-import { collectUsageData, loadUsageCache, parseSessionBuffer, projectLabelFromCwd, saveUsageCache } from "../usage-extension/data.ts";
+import { cacheHitPercent, collectUsageData, formatCacheHitPercent, loadUsageCache, parseSessionBuffer, projectLabelFromCwd, saveUsageCache } from "../usage-extension/data.ts";
+
+test("cacheHitPercent counts reads, not writes, against all prompt input", () => {
+	assert.equal(cacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 800 }), 80);
+	assert.equal(cacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 0 }), 0);
+	assert.equal(cacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 100 }), 100);
+	assert.equal(cacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 0 }), undefined);
+	assert.equal(formatCacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 800 }), "80.0%");
+	assert.equal(formatCacheHitPercent({ input: 100, cacheWrite: 0, cacheRead: 0 }), "0.0%");
+	assert.equal(formatCacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 0 }), "-");
+	assert.equal(formatCacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 100 }), "100%");
+	assert.equal(formatCacheHitPercent({ input: 1, cacheWrite: 0, cacheRead: 9999 }), "99.9%");
+});
 
 // 2026-07-15 is a Wednesday. Week = Mon 13th 00:00 → …, last week = Mon 6th → Sun 12th.
 const NOW = new Date(2026, 6, 15, 12, 0, 0);
@@ -376,6 +388,31 @@ test("collectUsageData aggregates periods, providers, and dedupes branched histo
 	assert.equal(anthropic.models.get("claude-fable-5").messages, 2);
 	assert.equal(openai.messages, 1);
 	assert.equal(openai.cost, 4);
+});
+
+test("collectUsageData prices zero-cost paid Devin DeepSeek without charging free SWE-2", async (t) => {
+	const { sessionsDir, cachePath } = fixture(t);
+	writeFileSync(
+		join(sessionsDir, "devin.jsonl"),
+		[
+			sessionLine("devin-paid", TS_TODAY),
+			assistantLine({ ts: TS_TODAY, provider: "devin", model: "deepseek-v4.1-flash", cost: 0, input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 }),
+			assistantLine({ ts: TS_TODAY + 1000, provider: "devin", model: "swe-2", cost: 0, input: 1_000_000, output: 1_000_000 }),
+			assistantLine({ ts: TS_TODAY + 2000, provider: "devin", model: "deepseek-v4.1-flash", cost: 3, input: 1_000_000, output: 1_000_000 }),
+			assistantLine({ ts: TS_TODAY + 3000, provider: "other", model: "deepseek-v4.1-flash", cost: 0, input: 1_000_000, output: 1_000_000 }),
+		].join("\n") + "\n"
+	);
+	for (let pass = 0; pass < 2; pass++) {
+		const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+		assert.ok(data);
+		const devin = data.today.providers.get("devin");
+		assert.ok(devin);
+		assert.ok(Math.abs(devin.models.get("deepseek-v4.1-flash").cost - 3.89) < 1e-9);
+		assert.equal(devin.models.get("swe-2").cost, 0);
+		assert.ok(Math.abs(data.today.totals.cost - 3.89) < 1e-9);
+		const hour = data.hourly.get(Math.floor(TS_TODAY / 3_600_000) * 3_600_000);
+		assert.ok(Math.abs(hour.get("devin\u0000deepseek-v4.1-flash\u0000").cost - 3.89) < 1e-9);
+	}
 });
 
 test("collectUsageData includes tool and summary usage without inflating assistant message counts", async (t) => {
@@ -938,7 +975,8 @@ test("pi test providers are excluded from all stats", async (t) => {
 		[
 			sessionLine("s1", TS_TODAY),
 			assistantLine({ ts: TS_TODAY, cost: 2 }),
-			assistantLine({ ts: TS_TODAY + 1000, cost: 99, provider: "faux-provider", model: "faux" }),
+			assistantLine({ ts: TS_TODAY + 1000, cost: 99, provider: "faux", model: "faux-1" }),
+			assistantLine({ ts: TS_TODAY + 1500, cost: 99, provider: "faux-provider", model: "faux" }),
 			assistantLine({ ts: TS_TODAY + 2000, cost: 99, provider: "fake-provider", model: "fake" }),
 		].join("\n") + "\n"
 	);
@@ -946,6 +984,7 @@ test("pi test providers are excluded from all stats", async (t) => {
 	const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
 	assert.equal(data.today.totals.cost, 2, "test-provider cost is excluded");
 	assert.equal(data.today.totals.messages, 1, "test-provider messages are excluded");
+	assert.ok(!data.today.providers.has("faux"), "the real faux provider id is excluded");
 	assert.ok(!data.today.providers.has("faux-provider"));
 	assert.ok(!data.today.providers.has("fake-provider"));
 });

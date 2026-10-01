@@ -21,8 +21,10 @@ import {
 	collectNamedFiles,
 	collectOpenCodeMessageFiles,
 	disabledUsageSources,
+	freeTierUsd,
 	fallbackSessionId,
 	parseUsageFileBuffer,
+	pricedDevinCost,
 } from "./sources.ts";
 import type { ExtraSourceKind, ResolvedUsageSources, UsageFileKind } from "./sources.ts";
 
@@ -38,9 +40,25 @@ export interface TokenStats {
 	cacheWrite: number;
 }
 
+/** Share of prompt input served from cache, using provider-reported token buckets. */
+export function cacheHitPercent(tokens: Pick<TokenStats, "input" | "cacheRead" | "cacheWrite">): number | undefined {
+	const promptInput = tokens.input + tokens.cacheWrite + tokens.cacheRead;
+	return promptInput > 0 ? (tokens.cacheRead / promptInput) * 100 : undefined;
+}
+
+/** Keep the table cell within five columns without rounding a near-hit to 100%. */
+export function formatCacheHitPercent(tokens: Pick<TokenStats, "input" | "cacheRead" | "cacheWrite">): string {
+	const percent = cacheHitPercent(tokens);
+	return percent === undefined ? "-" : percent === 100 ? "100%" : `${Math.min(percent, 99.9).toFixed(1)}%`;
+}
+
 export interface BaseStats {
 	messages: number;
 	cost: number;
+	/** Catalog-priced equivalent of the same tokens. Equals `cost` for paid
+	 * usage; for free-tier models (e.g. devin swe-2) it is what the tokens
+	 * would have cost at list pricing while `cost` stays $0. */
+	estCost: number;
 	tokens: TokenStats;
 }
 
@@ -91,7 +109,7 @@ interface PeriodRawData {
 	sessionCosts: Map<string, number>;
 	/** Cost of each session's first-ever message falling in this period. */
 	upfrontCost: number;
-	/** Cache misses after >TTL_GAP_MS idle — resuming after the cache expired. */
+	/** Large re-sends after a >TTL_GAP_MS gap. The gap is timing, not proof the cache expired. */
 	ttlMissCost: number;
 	/** Cache misses right after a mid-session model switch (no idle gap). */
 	modelSwitchMissCost: number;
@@ -135,6 +153,9 @@ export interface TimeFilteredStats {
 export interface HourlyCell {
 	messages: number;
 	cost: number;
+	/** List-priced equivalent of the tokens used (equals cost for paid usage,
+	 * catalog estimate for free-tier models like devin swe-2). */
+	estCost: number;
 	input: number;
 	output: number;
 	cacheRead: number;
@@ -989,17 +1010,17 @@ function emptyTokens(): TokenStats {
 }
 
 function emptyModelStats(): ModelStats {
-	return { sessions: new Set(), messages: 0, cost: 0, tokens: emptyTokens() };
+	return { sessions: new Set(), messages: 0, cost: 0, estCost: 0, tokens: emptyTokens() };
 }
 
 function emptyProviderStats(): ProviderStats {
-	return { sessions: new Set(), messages: 0, cost: 0, tokens: emptyTokens(), models: new Map() };
+	return { sessions: new Set(), messages: 0, cost: 0, estCost: 0, tokens: emptyTokens(), models: new Map() };
 }
 
 function emptyTimeFilteredStats(): TimeFilteredStats {
 	return {
 		providers: new Map(),
-		totals: { sessions: 0, messages: 0, cost: 0, tokens: emptyTokens() },
+		totals: { sessions: 0, messages: 0, cost: 0, estCost: 0, tokens: emptyTokens() },
 		insights: { insights: [] },
 	};
 }
@@ -1075,11 +1096,12 @@ function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg
 	const key = makeHourlyKey(msg.provider, msg.model, msg.thinkingLevel);
 	let cell = bucket.get(key);
 	if (!cell) {
-		cell = { messages: 0, cost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+		cell = { messages: 0, cost: 0, estCost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
 		bucket.set(key, cell);
 	}
 	if (msg.source === "assistant") cell.messages++;
 	cell.cost += msg.cost;
+	cell.estCost += freeTierUsd(msg.provider, msg.model, { ...msg, cost: msg.cost });
 	cell.input += msg.input;
 	cell.output += msg.output;
 	cell.cacheRead += msg.cacheRead;
@@ -1092,10 +1114,12 @@ function accumulateStats(
 	target: BaseStats,
 	cost: number,
 	tokens: { total: number; input: number; output: number; cacheRead: number; cacheWrite: number },
-	countMessage: boolean
+	countMessage: boolean,
+	estCost = cost
 ): void {
 	if (countMessage) target.messages++;
 	target.cost += cost;
+	target.estCost += estCost;
 	target.tokens.total += tokens.total;
 	target.tokens.input += tokens.input;
 	target.tokens.output += tokens.output;
@@ -1182,13 +1206,16 @@ function addMessagesToUsageData(
 			}
 
 			const isAssistant = msg.source === "assistant";
+			// Free-tier usage records cost $0 — estimate what the same tokens
+			// would cost at catalog list pricing so the UI can show both.
+			const estCost = freeTierUsd(msg.provider, msg.model, msg);
 			modelStats.sessions.add(sessionId);
-			accumulateStats(modelStats, msg.cost, tokens, isAssistant);
+			accumulateStats(modelStats, msg.cost, tokens, isAssistant, estCost);
 
 			providerStats.sessions.add(sessionId);
-			accumulateStats(providerStats, msg.cost, tokens, isAssistant);
+			accumulateStats(providerStats, msg.cost, tokens, isAssistant, estCost);
 
-			accumulateStats(stats.totals, msg.cost, tokens, isAssistant);
+			accumulateStats(stats.totals, msg.cost, tokens, isAssistant, estCost);
 			sessionContributed[period] = true;
 
 			const raw = rawByPeriod[period];
@@ -1586,6 +1613,7 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 		let previousAssistant: SessionMessage | null = null;
 		for (const m of rawMsgs) {
 			m.provider = canonicalProvider(m.provider);
+			if (m.source === "assistant") m.cost = pricedDevinCost(m.provider, m.model, m);
 			// Auxiliary usage is interleaved with conversation entries, but it must
 			// not become the "previous message" for cache-miss classification.
 			const prev = m.source === "assistant" ? previousAssistant : null;
@@ -1667,8 +1695,12 @@ const TREND_LOW_RATIO = 0.6;
 const TTL_GAP_MS = 5 * 60_000;
 const MISS_MIN_PREV_CONTEXT = 20_000;
 const MISS_MAX_CACHE_READ = 5_000;
-/** pi's built-in test providers never send anything to a real API. */
-const EXCLUDED_PROVIDERS = new Set(["faux-provider", "fake-provider"]);
+/** pi's built-in test providers never send anything to a real API. The ids pi
+ * actually records are `faux` (the default id in providers/faux.ts) and
+ * `fake-provider` (used by the RPC prompt tests); `faux-provider` appears only
+ * as a fixture label in pi's own test suite. Keep all three so no spelling of a
+ * test provider can reach the table, graphs, totals, or insights. */
+const EXCLUDED_PROVIDERS = new Set(["faux", "faux-provider", "fake-provider"]);
 
 const CACHE_MISS_ALARM_PERCENT = 2;
 const CACHE_MISS_ALARM_MIN_COST = 1;
@@ -1717,7 +1749,7 @@ function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodIns
 			stat: fmtMoney(raw.ttlMissCost),
 			headline: `spent resuming conversations after a break (${fmtPercent(ttlPct)} of ${assistantPctLabel})`,
 			advice:
-				"Sent context is only reusable for a few minutes. After a longer pause, the next message pays to send the whole conversation again. Replying while a session is fresh avoids this.",
+				"These large re-sends came after a pause. A pause is not proof the provider cache expired — some models keep a prefix for half an hour or more, and the same session can miss after a short gap and hit after a long one.",
 		});
 	}
 

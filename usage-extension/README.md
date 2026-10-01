@@ -95,14 +95,14 @@ The **Insights** view has two sections, facts first:
 
 | Alarm | Fires when |
 |---|---|
-| Resuming after a break | ≥ 2% of the period's cost (and ≥ $1) went to messages that re-sent a large conversation from scratch after a > 5 min idle gap — provider caches expire after a few minutes idle |
+| Resuming after a break | ≥ 2% of the period's cost (and ≥ $1) went to messages that re-sent a large conversation from scratch after a > 5 min gap. The gap is timing only — it is not proof the provider cache expired |
 | Switching models mid-conversation | ≥ 2% of cost (and ≥ $1) went to large-context misses right after the provider/model changed mid-session — the previous model's cache doesn't transfer |
 | Mid-session re-sends (prefix change) | ≥ 2% of cost (and ≥ $1) went to large-context misses with **no** idle gap, compaction, or model switch to explain them — something rewrote the request prefix |
 | Session concentration | the top 5 sessions account for ≥ 35% of the period's cost |
 | Upfront tax | ≥ 8% of cost was the first message of a session (session starts pay for their whole prompt uncached) |
 | Cache leverage floor | fewer than 5 cached tokens served per fresh token paid (shown only above $5 / 1M fresh tokens, to avoid noise) |
 
-pi's built-in test providers (`faux-provider`, `fake-provider`) never call a real API and are excluded from all statistics, graphs, and insights.
+pi's built-in test providers (`faux`, `faux-provider`, `fake-provider`) never call a real API and are excluded from all statistics, graphs, and insights.
 
 **Unit:** insights are weighted by recorded API cost (USD). Periods with no recorded cost show an explicit empty state rather than silently switching to a different unit.
 
@@ -168,7 +168,10 @@ Time periods are calculated in the local timezone where Pi runs. If you want to 
 | **Tokens** | Fresh tokens for the turn: input + output + cache write |
 | **↑In** | Fresh input tokens: input + cache write *(dimmed)* |
 | **↓Out** | Output tokens *(dimmed)* |
-| **Cache** | Cache read + write tokens *(dimmed; informational)* |
+| **Cache** | Cache read + write tokens *(dimmed; informational; hidden before Hit% on narrower terminals)* |
+| **Hit%** | Share of prompt input served from cache: `cacheRead / (input + cacheWrite + cacheRead)`; `-` when no prompt input was reported |
+
+`Hit%` uses provider-reported token buckets, not the `Cache` column or output tokens. Cache writes are **misses**, not hits. The rate is aggregated from token totals across the selected period (not an average of per-message rates). Auxiliary Pi `cache_warm` usage entries are not currently ingested by this dashboard, so refresh costs are not part of these table totals.
 
 > **As of 0.2.0:** `Tokens = Input + Output + CacheWrite` and `↑In = Input + CacheWrite`. `CacheRead` stays out of `Tokens` so repeated cache hits don't swamp the dashboard. The dashboard itself shows a one-line footer reminder.
 
@@ -205,7 +208,7 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 
 ### Cost Tracking
 
-Cost data comes directly from persisted usage values. For assistant messages it is grouped by provider/model. Pi 0.81.0+ can also persist usage reported by tools, compaction, and branch summarization; because those entries do not carry reliable provider/model attribution, `/usage` groups them under `Tools / summaries`, matching Pi's `/session` breakdown. Recognised legacy `subagent` and `subagent_wait` details are used as a fallback when their child session is no longer available. Accuracy depends on the provider or tool reporting costs.
+Cost data usually comes directly from persisted usage values. Devin's `deepseek-v4.1-flash` can persist $0 despite being a paid model: `/usage` estimates its missing cost from Devin's catalog ($0.22/M fresh input, $0.01/M cached input, $0.66/M output). This is a token-based estimate, not an invoice; reported nonzero costs take precedence, and free Devin `swe-2` remains $0. Assistant messages are grouped by provider/model. Pi 0.81.0+ can also persist usage reported by tools, compaction, and branch summarization; because those entries do not carry reliable provider/model attribution, `/usage` groups them under `Tools / summaries`, matching Pi's `/session` breakdown. Recognised legacy `subagent` and `subagent_wait` details are used as a fallback when their child session is no longer available. Accuracy depends on the provider or tool reporting costs.
 
 Only persisted usage can be counted. Pi did not add usage metadata retroactively, so historical compaction or branch-summary entries written without `usage` remain unmetered: their exact token and cost vectors cannot be reconstructed. The compatibility audit corpus contained 2,753 such compactions and 20 branch summaries.
 
@@ -219,7 +222,7 @@ Cache token support varies by provider:
 | Google | ✓ | ✗ |
 | OpenAI Codex | ✓ | ✗ |
 
-The "Cache" column combines both read and write tokens.
+The "Cache" column combines both read and write tokens; `Hit%` separates reads from writes and divides reads by all prompt input.
 
 `Tokens` and `↑In` include cache writes but intentionally exclude cache reads. That keeps totals aligned with fresh/billed prompt work without letting repeated cache hits swamp the dashboard.
 

@@ -13,7 +13,7 @@ import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-wor
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Container, Spacer, matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-import { collectUsageData, compareNamedSeries, getAgentDir, TAB_ORDER } from "./data";
+import { collectUsageData, compareNamedSeries, formatCacheHitPercent, getAgentDir, TAB_ORDER } from "./data";
 import type { CollectProgress } from "./data";
 import { parseUsageSourcesSetting } from "./sources";
 import type { ResolvedUsageSources } from "./sources";
@@ -71,14 +71,24 @@ interface TableLayout {
 	columns: DataColumn[];
 	nameWidth: number;
 	tableWidth: number;
+	/** Spaces between columns, chosen by getTableLayout (COLUMN_GAP, or 1 when
+	 * the wider gap would cost a column). Always >= 1 so cells cannot fuse. */
+	gap: number;
 	compact: boolean;
 }
 
 const MAX_NAME_COL_WIDTH = 26;
 
+// Explicit separator between every pair of columns (name→first column and
+// column→column). Right-aligned padding alone cannot guarantee a gap: a value
+// exactly as wide as its column leaves zero leading spaces, which fused the
+// Total row's `$10480 ($10000)` against the Msgs count. The gap is paid for by
+// trimming the slack-heavy numeric columns below.
+const COLUMN_GAP = 2;
+
 const SESSIONS_COLUMN: DataColumn = {
 	label: "Sessions",
-	width: 9,
+	width: 8,
 	getValue: (s) => formatNumber(typeof s.sessions === "number" ? s.sessions : s.sessions.size),
 };
 
@@ -90,19 +100,26 @@ const MSGS_COLUMN: DataColumn = {
 
 const COST_COLUMN: DataColumn = {
 	label: "Cost",
-	width: 9,
-	getValue: (s) => formatCost(s.cost),
+	width: 15,
+	// Free-tier models (e.g. devin swe-2) record real token usage with an
+	// explicit $0 cost — show the catalog-priced equivalent with the actual
+	// charge in parens: "$12.50 ($0)" = burned $12.50 of free tokens.
+	getValue: (s) => {
+		if (s.estCost > s.cost) return `${formatCost(s.estCost)} (${s.cost === 0 ? "$0" : formatCost(s.cost)})`;
+		if (s.cost === 0 && hasRecordedTokens(s)) return "$0";
+		return formatCost(s.cost);
+	},
 };
 
 const TOKENS_COLUMN: DataColumn = {
 	label: "Tokens",
-	width: 9,
+	width: 7,
 	getValue: (s) => formatTokens(s.tokens.total),
 };
 
 const INPUT_COLUMN: DataColumn = {
 	label: "↑In",
-	width: 8,
+	width: 6,
 	dimmed: true,
 	// Include cacheWrite so this reflects fresh input tokens sent this turn,
 	// even for providers like Anthropic that split cached prompt creation out
@@ -112,30 +129,38 @@ const INPUT_COLUMN: DataColumn = {
 
 const OUTPUT_COLUMN: DataColumn = {
 	label: "↓Out",
-	width: 8,
+	width: 6,
 	dimmed: true,
 	getValue: (s) => formatTokens(s.tokens.output),
 };
 
 const CACHE_COLUMN: DataColumn = {
 	label: "Cache",
-	width: 8,
+	width: 6,
 	dimmed: true,
 	getValue: (s) => formatTokens(s.tokens.cacheRead + s.tokens.cacheWrite),
 };
 
-const FULL_DATA_COLUMNS: DataColumn[] = [
+const HIT_COLUMN: DataColumn = {
+	label: "Hit%",
+	width: 5,
+	getValue: (s) => formatCacheHitPercent(s.tokens),
+};
+
+const PRIMARY_DATA_COLUMNS: DataColumn[] = [
 	SESSIONS_COLUMN,
 	MSGS_COLUMN,
 	COST_COLUMN,
 	TOKENS_COLUMN,
 	INPUT_COLUMN,
 	OUTPUT_COLUMN,
-	CACHE_COLUMN,
+	HIT_COLUMN,
 ];
+const FULL_DATA_COLUMNS: DataColumn[] = [...PRIMARY_DATA_COLUMNS.slice(0, -1), CACHE_COLUMN, HIT_COLUMN];
 
 const TABLE_LAYOUTS: TableLayoutCandidate[] = [
 	{ columns: FULL_DATA_COLUMNS, minNameWidth: MAX_NAME_COL_WIDTH },
+	{ columns: PRIMARY_DATA_COLUMNS, minNameWidth: MAX_NAME_COL_WIDTH },
 	{ columns: [SESSIONS_COLUMN, MSGS_COLUMN, COST_COLUMN, TOKENS_COLUMN], minNameWidth: 14, compact: true },
 	{ columns: [SESSIONS_COLUMN, COST_COLUMN, TOKENS_COLUMN], minNameWidth: 12, compact: true },
 	{ columns: [COST_COLUMN, TOKENS_COLUMN], minNameWidth: 10, compact: true },
@@ -145,6 +170,11 @@ const TABLE_LAYOUTS: TableLayoutCandidate[] = [
 // =============================================================================
 // Formatting Helpers
 // =============================================================================
+
+/** True when the row carries recorded token usage (any bucket, cache included). */
+function hasRecordedTokens(s: { tokens: { total: number; cacheRead: number; cacheWrite: number } }): boolean {
+	return s.tokens.total + s.tokens.cacheRead + s.tokens.cacheWrite > 0;
+}
 
 function formatCost(cost: number): string {
 	if (cost === 0) return "-";
@@ -243,26 +273,36 @@ function pickFittingText(width: number, variants: string[]): string {
 function getTableLayout(width: number): TableLayout {
 	const safeWidth = Math.max(width, 0);
 
+	// Layout preference wins over gap size: try each layout with the full
+	// COLUMN_GAP first, then with a single space, keeping the primary seven
+	// columns (including Hit%) when Cache volume does not fit.
+	// A gap of at least 1 is what makes fusion impossible — the earlier zero-gap
+	// bug came from relying on right-alignment padding, which vanishes when a
+	// value is exactly as wide as its column.
 	for (const candidate of TABLE_LAYOUTS) {
-		const columnsWidth = sumColumnWidths(candidate.columns);
-		const nameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - columnsWidth, 0));
-		if (nameWidth >= candidate.minNameWidth) {
-			return {
-				columns: candidate.columns,
-				nameWidth,
-				tableWidth: nameWidth + columnsWidth,
-				compact: candidate.compact ?? false,
-			};
+		for (const gap of [COLUMN_GAP, 1]) {
+			const columnsWidth = sumColumnWidths(candidate.columns) + gap * candidate.columns.length;
+			const nameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - columnsWidth, 0));
+			if (nameWidth >= candidate.minNameWidth) {
+				return {
+					columns: candidate.columns,
+					nameWidth,
+					tableWidth: nameWidth + columnsWidth,
+					gap,
+					compact: candidate.compact ?? false,
+				};
+			}
 		}
 	}
 
 	const fallback = TABLE_LAYOUTS[TABLE_LAYOUTS.length - 1]!;
-	const fallbackColumnsWidth = sumColumnWidths(fallback.columns);
+	const fallbackColumnsWidth = sumColumnWidths(fallback.columns) + 1 * fallback.columns.length;
 	const fallbackNameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - fallbackColumnsWidth, 0));
 	return {
 		columns: fallback.columns,
 		nameWidth: fallbackNameWidth,
 		tableWidth: fallbackNameWidth + fallbackColumnsWidth,
+		gap: 1,
 		compact: fallback.compact ?? false,
 	};
 }
@@ -345,6 +385,7 @@ class UsageComponent {
 			const synth: ProviderStats = {
 				messages: 0,
 				cost: 0,
+				estCost: 0,
 				tokens: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				sessions: new Set<string>(),
 				models,
@@ -352,6 +393,7 @@ class UsageComponent {
 			for (const model of models.values()) {
 				synth.messages += model.messages;
 				synth.cost += model.cost;
+				synth.estCost += model.estCost;
 				synth.tokens.total += model.tokens.total;
 				synth.tokens.input += model.tokens.input;
 				synth.tokens.output += model.tokens.output;
@@ -367,12 +409,14 @@ class UsageComponent {
 			sessions: 0,
 			messages: 0,
 			cost: 0,
+			estCost: 0,
 			tokens: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		};
 		const sessions = new Set<string>();
 		for (const provider of providers.values()) {
 			totals.messages += provider.messages;
 			totals.cost += provider.cost;
+			totals.estCost += provider.estCost;
 			totals.tokens.total += provider.tokens.total;
 			totals.tokens.input += provider.tokens.input;
 			totals.tokens.output += provider.tokens.output;
@@ -790,13 +834,13 @@ class UsageComponent {
 	private renderHeader(layout: TableLayout): string[] {
 		const th = this.theme;
 
-		let headerLine = fitCell("Provider / Model", layout.nameWidth);
+		const parts = [fitCell("Provider / Model", layout.nameWidth)];
 		for (const col of layout.columns) {
 			const label = fitCell(col.label, col.width, "right");
-			headerLine += col.dimmed ? th.fg("dim", label) : label;
+			parts.push(col.dimmed ? th.fg("dim", label) : label);
 		}
 
-		return [th.fg("muted", headerLine), th.fg("border", "─".repeat(layout.tableWidth))];
+		return [th.fg("muted", parts.join(" ".repeat(layout.gap))), th.fg("border", "─".repeat(layout.tableWidth))];
 	}
 
 	private renderDataRow(
@@ -815,15 +859,15 @@ class UsageComponent {
 		const truncName = innerNameWidth > 0 ? truncateToWidth(name, innerNameWidth) : "";
 		const styledName = selected ? th.fg("accent", truncName) : dimAll ? th.fg("dim", truncName) : truncName;
 
-		let row = safePrefix + (innerNameWidth > 0 ? padRight(styledName, innerNameWidth) : "");
+		const parts = [safePrefix + (innerNameWidth > 0 ? padRight(styledName, innerNameWidth) : "")];
 
 		for (const col of layout.columns) {
 			const value = fitCell(col.getValue(stats), col.width, "right");
 			const shouldDim = col.dimmed || dimAll;
-			row += shouldDim ? th.fg("dim", value) : value;
+			parts.push(shouldDim ? th.fg("dim", value) : value);
 		}
 
-		return row;
+		return parts.join(" ".repeat(layout.gap));
 	}
 
 	private renderRows(layout: TableLayout): string[] {
@@ -859,7 +903,8 @@ class UsageComponent {
 				const models = Array.from(providerStats.models.entries()).sort((a, b) => b[1].cost - a[1].cost);
 
 				for (const [modelName, modelStats] of models) {
-					lines.push(this.renderDataRow(modelName, modelStats, layout, { indent: 4, dimAll: true }));
+					const free = modelStats.cost === 0 && hasRecordedTokens(modelStats);
+					lines.push(this.renderDataRow(free ? `${modelName} (free)` : modelName, modelStats, layout, { indent: 4, dimAll: true }));
 				}
 			}
 		}
@@ -871,23 +916,28 @@ class UsageComponent {
 		const th = this.theme;
 		const { totals } = this.visibleTable();
 
-		let totalRow = fitCell(th.bold("Total"), layout.nameWidth);
+		const parts = [fitCell(th.bold("Total"), layout.nameWidth)];
 		for (const col of layout.columns) {
 			const value = fitCell(col.getValue(totals), col.width, "right");
-			totalRow += col.dimmed ? th.fg("dim", value) : value;
+			parts.push(col.dimmed ? th.fg("dim", value) : value);
 		}
 
-		return [th.fg("border", "─".repeat(layout.tableWidth)), totalRow, ""];
+		return [th.fg("border", "─".repeat(layout.tableWidth)), parts.join(" ".repeat(layout.gap)), ""];
 	}
 
 	private renderFormulaNote(width: number): string[] {
-		const line = pickFittingText(width, [
+		const hitNote = pickFittingText(width, [
+			"Hit% = CacheRead / (Input + CacheWrite + CacheRead)",
+			"Hit% = cached input / all prompt input",
+			"Hit% = cached / prompt",
+		]);
+		const tokenNote = pickFittingText(width, [
 			"Tokens = Input + Output + CacheWrite  ·  ↑In = Input + CacheWrite  (as of 0.2.0)",
 			"Tokens = In + Out + CacheWrite  ·  ↑In = In + CacheWrite  (v0.2.0+)",
 			"Tokens & ↑In include CacheWrite (v0.2.0+)",
 			"Incl. CacheWrite (v0.2.0+)",
 		]);
-		return [this.theme.fg("dim", line), ""];
+		return [this.theme.fg("dim", hitNote), this.theme.fg("dim", tokenNote), ""];
 	}
 
 	private renderHelp(width: number): string[] {

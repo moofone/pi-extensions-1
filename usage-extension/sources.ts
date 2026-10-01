@@ -310,6 +310,9 @@ interface TokenRates {
 }
 
 const MODEL_RATES: Record<string, TokenRates> = {
+	// Devin CLI catalog: $0.22 / 1M fresh input, $0.01 cached input,
+	// $0.66 output. Pi records cached input separately from fresh input.
+	"devin/deepseek-v4.1-flash": { input: 0.22, output: 0.66, cacheRead: 0.01, cacheWrite: 0 },
 	"claude-opus-5": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 	"claude-opus-4": { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 },
 	"claude-sonnet-5": { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
@@ -329,6 +332,12 @@ const MODEL_RATES: Record<string, TokenRates> = {
 	"glm-5.2": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
 	"glm-5.1": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
 	"glm-5": { input: 1, output: 3.2, cacheRead: 0.2, cacheWrite: 0 },
+	// SWE-2 is free in Devin Desktop/CLI through 2026-10-10 and publishes no
+	// per-token price. Cognition's blog places it at "a quarter of the cost of
+	// GPT-6 Astra" ($10/$50 list) → $2.50/$12.50. Cached read uses the
+	// standard ~10%-of-input convention used across the Devin catalog
+	// (Opus $5→$0.50, Astra $10→$1), NOT Lightning's atypical $1 rate.
+	"swe-2": { input: 2.5, output: 12.5, cacheRead: 0.25, cacheWrite: 3.125 },
 	"muse-spark-1.3-contributor-free": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	"muse-spark-1.2-contributor-free": { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 	"muse-spark-1.3-contributor": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
@@ -342,26 +351,51 @@ const PROVIDER_RATES: Record<string, TokenRates> = {
 	"openai-codex": { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 },
 	xai: { input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 },
 	zai: { input: 0.6, output: 2.2, cacheRead: 0.11, cacheWrite: 0 },
+	// Defensive: zcode-re folds into zai via canonicalProvider, but keep its
+	// flagship rates so an un-folded log still prices sensibly.
+	"zcode-re": { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 },
 	"opencode-go": { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 },
 };
 
 const ZERO_RATES: TokenRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
 function ratesFor(provider: string, model: string): TokenRates {
-	const stripped = model.replace(/-build$/, "");
-	for (const id of [`${provider}/${model}`, model, `${provider}/${stripped}`, stripped]) {
+	// Catalog keys are lowercase; session logs mix case (zcode-re records
+	// "GLM-5.3-Flash" / "GLM-5.3"), so match case-insensitively.
+	const lowered = model.toLowerCase();
+	const stripped = lowered.replace(/-build$/, "");
+	const providerKey = provider.toLowerCase();
+	for (const id of [`${providerKey}/${lowered}`, lowered, `${providerKey}/${stripped}`, stripped]) {
 		const exact = MODEL_RATES[id];
 		if (exact) return exact;
 	}
 	let best: TokenRates | undefined;
 	let bestLen = 0;
 	for (const [id, rates] of Object.entries(MODEL_RATES)) {
-		if ((model.startsWith(id) || stripped.startsWith(id)) && id.length > bestLen) {
+		if ((lowered.startsWith(id) || stripped.startsWith(id)) && id.length > bestLen) {
 			best = rates;
 			bestLen = id.length;
 		}
 	}
-	return best ?? PROVIDER_RATES[provider] ?? ZERO_RATES;
+	return best ?? PROVIDER_RATES[providerKey] ?? ZERO_RATES;
+}
+
+/** Models with a published $0/free tier that still burn real tokens. Only
+ * these get a list-priced equivalent (`estCost`); every other model's
+ * estimated cost is its recorded cost — paid models are never repriced. */
+const FREE_TIER_MODELS = new Set([
+	"swe-2",
+	// Z.AI plan routes (zcode-re folds into zai) record $0 — subscription/promo
+	// tokens (e.g. the 300M-token promo) cover usage while real tokens burn.
+	"glm-5.3",
+	"glm-5.3-flash",
+]);
+
+/** List-priced USD for free-tier usage; passes recorded cost through for
+ * anything else. Used for "what would this have cost" display only. */
+export function freeTierUsd(provider: string, model: string, amount: UsageAmount): number {
+	if (!FREE_TIER_MODELS.has(model.toLowerCase())) return amount.cost;
+	return estimateUsd(provider, model, amount);
 }
 
 /** Catalog estimate in USD. Extra-source logs often store tokens with no invoice. */
@@ -374,6 +408,14 @@ export function estimateUsd(provider: string, model: string, amount: UsageAmount
 			amount.cacheWrite * rates.cacheWrite) /
 		1_000_000
 	);
+}
+
+/** Pi's Devin adapter can record $0 for paid DeepSeek despite token usage.
+ * Estimate only this known paid family; never reprice free SWE-2 or replace
+ * a nonzero cost reported by the provider. This is not a billing invoice. */
+export function pricedDevinCost(provider: string, model: string, amount: UsageAmount): number {
+	if (provider !== "devin" || amount.cost !== 0 || model !== "deepseek-v4.1-flash") return amount.cost;
+	return estimateUsd(provider, model, amount);
 }
 
 function withPricedCost(provider: string, model: string, amount: UsageAmount): UsageAmount {
@@ -592,6 +634,9 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 export function canonicalProvider(provider: string): string {
 	if (provider === "opencode" || provider === "opencode-zen") return "opencode-go";
 	if (provider === "grok-build" || provider === "xai-grok-build") return "xai";
+	// Pi's ZCode coding-plan provider is Z.AI — fold it into zai so plan usage
+	// and API usage report as one provider row.
+	if (provider === "zcode-re") return "zai";
 	return provider;
 }
 

@@ -100,7 +100,9 @@ const MAX_HOURLY_BUCKETS = 8 * 24;
 function metricOf(cell: HourlyCell, metric: GraphMetric): number {
 	switch (metric) {
 		case "cost":
-			return cell.cost;
+			// List-priced value of tokens used. Identical to recorded cost for
+			// paid models; free-tier swe-2 charts its would-be cost.
+			return cell.estCost;
 		case "tokens":
 			// Matches the dashboard formula: fresh tokens = input + output + cacheWrite.
 			return cell.input + cell.output + cell.cacheWrite;

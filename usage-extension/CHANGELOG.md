@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Table `Hit%` column shows the provider-reported cache-read share of prompt input, per provider/model and total; cache writes count as misses. On narrow terminals it takes priority over the informational cache-token volume.
 - Optional extra sources, **off by default**. Enable under `usage-extension.sources` in `settings.json`; disabled trees are not walked.
   - Claude Code → `anthropic`
   - Codex CLI → `openai-codex`
@@ -13,6 +14,12 @@
 
 ### Changed
 - Graph/table: `opencode-go` and `muse-spark-*` stay first-class series (not folded into `other`). Synthetic `Tools` sorts last among named providers.
+- Table columns are now separated by an explicit gap (2 spaces; 1 space on narrower terminals) instead of relying on right-alignment padding. The gap is funded by trimming the slack-heavy numeric columns (Sessions 9→8, Tokens 9→7, ↑In/↓Out/Cache 8→6; Msgs and Cost unchanged), so the seven primary columns (with `Hit%` in place of raw `Cache` volume) fit at ~92 columns; wider terminals show both.
+
+### Fixed
+- Insights no longer say a pause of a few minutes expired the provider cache. A gap is recorded as timing, not as the cause of a re-send.
+- Totals row alignment: a Cost value exactly as wide as its column (e.g. `$10480 ($10000)`, 15 chars in a 15-wide column) left zero leading padding and fused with the messages count as `104,048$10480 ($10000)`. Right-alignment can never guarantee a gap, so cells are now joined with an explicit separator that is at least one space at any width.
+- The `Faux` test provider no longer appears in the table, graphs, totals, or insights. The exclusion list matched `faux-provider` and `fake-provider`, but pi records the real id as `faux` (the default in `providers/faux.ts`); `faux-provider` exists only as a fixture label in pi's own test suite, so the filter never matched anything on disk.
 
 ## [0.9.4] - 2026-07-22
 
