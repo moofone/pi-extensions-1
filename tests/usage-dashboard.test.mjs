@@ -191,6 +191,24 @@ test("renderStackedBars splits a cell between two segments with fg/bg at 1/8 res
 	assert.ok(lines[2].includes(`<${PAINT_MARK}/-1:▲>`), "selected bucket is marked on the axis");
 });
 
+test("renderStackedBars noBackground mode never emits a background and picks the dominant segment", () => {
+	const hourly = hourlyOf([
+		[dayAt(0, 9), "a", "m", { cost: 3 }],
+		[dayAt(0, 10), "b", "m", { cost: 1 }],
+	]);
+	const dayPlan = { unit: "day", buckets: [{ startMs: TODAY, endMs: TODAY + 24 * HOUR }], nowIdx: 0 };
+	const model = buildUsageStack(hourly, dayPlan, "cost", "provider", 5);
+	const paint = (fg, bg, text) => `<${fg}/${bg}:${text}>`;
+	const lines = renderStackedBars(model, { width: 20, height: 2, formatValue: String, formatBucket: () => "d", paint, maxBarWidth: 1, noBackground: true });
+	for (const l of lines) assert.ok(!/<-?\d+\/[0-9]+:/.test(l), `no series background in: ${l}`);
+	// Top row: a has 4 eighths, b has 4 → tie keeps the lower segment; full height.
+	assert.match(lines[0], /<0\/-1:█>/);
+	// a = 10 of 16 eighths, b = 6: the top row holds 2 of a and 6 of b, so b wins.
+	const skew = buildUsageStack(hourlyOf([[dayAt(0, 9), "a", "m", { cost: 2.5 }], [dayAt(0, 10), "b", "m", { cost: 1.5 }]]), dayPlan, "cost", "provider", 5);
+	const skewLines = renderStackedBars(skew, { width: 20, height: 2, formatValue: String, formatBucket: () => "d", paint, maxBarWidth: 1, noBackground: true });
+	assert.match(skewLines[0], /<1\/-1:█>/, "b covers 6 of the top row's 8 eighths");
+});
+
 test("renderStackedBars gives any non-empty bucket at least a sliver", () => {
 	const hourly = hourlyOf([
 		[dayAt(1), "a", "m", { cost: 1000 }],

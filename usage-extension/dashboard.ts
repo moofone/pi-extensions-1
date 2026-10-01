@@ -44,6 +44,13 @@ import { renderChart } from "./graph.ts";
 
 export type Memo = <T>(key: string, build: () => T) => T;
 
+/**
+ * pi-appserver sets PI_APPSERVER=1; its native canvas draws ui.custom output on
+ * a terminal surface that turns any SGR background into a highlight, so bars
+ * must be foreground-only there. PI_USAGE_CANVAS=1 forces it for testing.
+ */
+const CANVAS_SAFE = process.env.PI_APPSERVER === "1" || process.env.PI_USAGE_CANVAS === "1";
+
 // =============================================================================
 // Colours (256-colour, stable per series name)
 // =============================================================================
@@ -369,6 +376,7 @@ export function renderDailyView(th: Theme, data: UsageData, state: DailyViewStat
 			formatBucket: bucketAxisLabel,
 			selectedIdx: selected,
 			paint: stackPainter(th, colors),
+			noBackground: CANVAS_SAFE,
 		})
 	);
 	lines.push("");
@@ -636,6 +644,7 @@ export function renderCacheView(
 				formatBucket: bucketAxisLabel,
 				selectedIdx: selected,
 				paint: stackPainter(th, compColors),
+				noBackground: CANVAS_SAFE,
 			})
 		);
 		const legend = stack.series.map((s, i) => {

@@ -424,6 +424,12 @@ export interface StackRenderOptions {
 	paint?: StackPaint;
 	/** Max bar width in cells; default 7. */
 	maxBarWidth?: number;
+	/**
+	 * Never emit background colours. Surfaces that replace SGR backgrounds with
+	 * a highlight (pi-hud's native canvas) would otherwise smear segment joins;
+	 * each cell instead takes the colour of the segment covering most of it.
+	 */
+	noBackground?: boolean;
 }
 
 export interface StackLayout {
@@ -520,7 +526,24 @@ export function renderStackedBars(model: StackModel, options: StackRenderOptions
 		const upper = segmentAt(b, lo + 7);
 		if (upper === lower) return { ch: EIGHTHS[8], fg: lower, bg: PAINT_NONE };
 		const fill = Math.max(1, Math.min(7, bounds[b]![lower]! - lo));
-		return { ch: EIGHTHS[fill]!, fg: lower, bg: upper };
+		if (!options.noBackground) return { ch: EIGHTHS[fill]!, fg: lower, bg: upper };
+		// Foreground-only: glyph height = where the whole stack ends in this cell,
+		// colour = the segment with the most eighths inside it.
+		const bb = bounds[b]!;
+		const top = bb[bb.length - 1] ?? 0;
+		const height = Math.max(1, Math.min(8, top - lo));
+		let best = lower;
+		let bestUnits = 0;
+		let prev = 0;
+		for (let k = 0; k < bb.length; k++) {
+			const units = Math.max(0, Math.min(bb[k]!, lo + 8) - Math.max(prev, lo));
+			if (units > bestUnits) {
+				best = k;
+				bestUnits = units;
+			}
+			prev = bb[k]!;
+		}
+		return { ch: EIGHTHS[height]!, fg: best, bg: PAINT_NONE };
 	};
 
 	const yLabel = (row: number): string => {
