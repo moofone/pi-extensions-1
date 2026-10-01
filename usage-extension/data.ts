@@ -1526,12 +1526,68 @@ export interface CollectUsageOptions {
 	sources?: ResolvedUsageSources;
 }
 
+/** In-process cores per (sessionsDir, cachePath, sources) so repeated calls are incremental. */
+const collectCores = new Map<string, { dispose(): Promise<void>; core: unknown; timer?: ReturnType<typeof setTimeout> }>();
+const COLLECT_CORE_IDLE_MS = 5 * 60_000;
+const COLLECT_CORE_LIMIT = 8;
+
 /**
- * Public entry point. The service lane (usage index) repoints this at the incremental index; until then it
- * is the legacy full pass.
+ * Public entry point: a thin wrapper over an in-process, non-watching usage index core
+ * (index/service.ts). The on-disk cache is the sharded store at `cachePath + ".d"` (importing the legacy
+ * single-file cache at `cachePath` once); `cachePath: null` keeps everything in memory for one call.
  */
 export async function collectUsageData(options: CollectUsageOptions = {}): Promise<UsageData | null> {
-	return collectUsageDataLegacy(options);
+	const { UsageIndexCore } = await import("./index/service.ts");
+	const agentDir = getAgentDir();
+	const sessionsDir = options.sessionsDir ?? join(agentDir, "sessions");
+	const cachePath = options.cachePath === undefined ? getDefaultCachePath() : options.cachePath;
+	const storeDir = cachePath === null ? null : cachePath === getDefaultCachePath() ? join(agentDir, "usage-index") : `${cachePath}.d`;
+	const indexOptions = {
+		agentDir,
+		sessionsDir,
+		sources: options.sources,
+		storeDir,
+		legacyCachePath: cachePath,
+		worker: false,
+		watch: false,
+	};
+	const make = () => new UsageIndexCore(indexOptions, { persistRollup: false, flushDebounceMs: 0 });
+	if (cachePath === null) {
+		// No persistence → no shared state between calls.
+		const core = make();
+		try {
+			return await core.snapshot({ now: options.now, signal: options.signal, onProgress: options.onProgress });
+		} finally {
+			await core.dispose();
+		}
+	}
+	const key = JSON.stringify([sessionsDir, cachePath, options.sources ?? null]);
+	let entry = collectCores.get(key);
+	if (!entry) {
+		const core = make();
+		entry = { core, dispose: () => core.dispose() };
+		collectCores.set(key, entry);
+		if (collectCores.size > COLLECT_CORE_LIMIT) {
+			const oldest = collectCores.keys().next().value as string;
+			const evicted = collectCores.get(oldest);
+			collectCores.delete(oldest);
+			void evicted?.dispose();
+		}
+	}
+	const core = entry.core as InstanceType<typeof UsageIndexCore>;
+	// Drop the in-memory index after a while without calls (it can hold the whole history).
+	if (entry.timer) clearTimeout(entry.timer);
+	const current = entry;
+	current.timer = setTimeout(() => {
+		if (collectCores.get(key) === current) collectCores.delete(key);
+		void current.dispose();
+	}, COLLECT_CORE_IDLE_MS);
+	current.timer.unref?.();
+	try {
+		return await core.snapshot({ now: options.now, signal: options.signal, onProgress: options.onProgress });
+	} finally {
+		await core.flush();
+	}
 }
 
 /**
