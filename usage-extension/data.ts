@@ -824,6 +824,8 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 // writes. Those five trailing fields are omitted when all zero (auxiliary and
 // extra-source rows), so a tuple has either the base or the extended length.
 const CACHE_VERSION = 7;
+// v6 is the 13-field base tuple form (no cost split / 1h cache writes); still readable (one-time store import).
+const LEGACY_CACHE_VERSION_V6 = 6;
 const MESSAGE_TUPLE_BASE_LENGTH = 13;
 const MESSAGE_TUPLE_LENGTH = 18;
 
@@ -894,7 +896,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
 	} catch {
 		return result; // Missing or corrupt cache — rebuild from scratch.
 	}
-	if (!raw || raw.version !== CACHE_VERSION || !Array.isArray(raw.names) || typeof raw.files !== "object" || raw.files === null) {
+	if (!raw || (raw.version !== CACHE_VERSION && raw.version !== LEGACY_CACHE_VERSION_V6) || !Array.isArray(raw.names) || typeof raw.files !== "object" || raw.files === null) {
 		return result;
 	}
 
