@@ -185,6 +185,11 @@ test("parseSessionBuffer extracts session id and assistant messages from compact
 		reasoning: 0,
 		timestamp: TS_TODAY,
 		afterCompaction: false,
+		costInput: 0,
+		costOutput: 0,
+		costCacheRead: 0,
+		costCacheWrite: 0,
+		cacheWrite1h: 0,
 	});
 	assert.equal(parsed.cwd, "/tmp");
 });
@@ -780,7 +785,7 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 
 	// Cache was rebuilt.
 	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-	assert.equal(cacheJson.version, 6);
+	assert.equal(cacheJson.version, 7);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -811,8 +816,8 @@ test("saveUsageCache/loadUsageCache round-trips file states", async (t) => {
 					sessionId: "s1",
 					cwd: "/home/u/projects/x",
 					messages: [
-						{ provider: "anthropic", model: "claude-fable-5", thinkingLevel: "xhigh", source: "assistant", sourceId: "", cost: 1.5, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 7, timestamp: TS_TODAY, afterCompaction: true },
-						{ provider: "Tools", model: "summaries", thinkingLevel: "Tools/summaries", source: "auxiliary", sourceId: "summary-a", cost: 0.25, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, reasoning: 0, timestamp: TS_OLD, afterCompaction: false },
+						{ provider: "anthropic", model: "claude-fable-5", thinkingLevel: "xhigh", source: "assistant", sourceId: "", cost: 1.5, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 7, timestamp: TS_TODAY, afterCompaction: true, costInput: 0.1, costOutput: 0.5, costCacheRead: 0.2, costCacheWrite: 0.7, cacheWrite1h: 40 },
+						{ provider: "Tools", model: "summaries", thinkingLevel: "Tools/summaries", source: "auxiliary", sourceId: "summary-a", cost: 0.25, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, reasoning: 0, timestamp: TS_OLD, afterCompaction: false, costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0, cacheWrite1h: 0 },
 					],
 					toolUsages: [
 						{
@@ -894,20 +899,24 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
 	writeFileSync(cachePath, JSON.stringify({ version: 5, names: [], files: {} }));
 	assert.equal((await loadUsageCache(cachePath)).size, 0);
 
+	// v6 caches predate the per-class cost split and 1h cache writes.
+	writeFileSync(cachePath, JSON.stringify({ version: 6, names: [], files: {} }));
+	assert.equal((await loadUsageCache(cachePath)).size, 0);
+
 	writeFileSync(
 		cachePath,
 		JSON.stringify({
-			version: 6,
+			version: 7,
 			names: ["p", "m", "high", "entry-a"],
 			files: {
-				"/ok.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3]], toolUsages: [] },
+				"/ok.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
 				"/bad-tuple.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1]], toolUsages: [] },
-				"/bad-name-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[7, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]], toolUsages: [] },
-				"/bad-level-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 9, 0, 0, 0, 3]], toolUsages: [] },
-				"/bad-source.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 7, 3]], toolUsages: [] },
-				"/bad-source-id.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 9]], toolUsages: [] },
+				"/bad-name-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[7, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
+				"/bad-level-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 9, 0, 0, 0, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
+				"/bad-source.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 7, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
+				"/bad-source-id.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 9, 0, 0, 0, 0, 0]], toolUsages: [] },
 				"/bad-tool.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [], toolUsages: [[3, TS_TODAY, [1, 2], 3, []]] },
-				"/no-cwd.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]], toolUsages: [] },
+				"/no-cwd.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
 				"/bad-shape.jsonl": { size: "x", mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [], toolUsages: [] },
 			},
 		})

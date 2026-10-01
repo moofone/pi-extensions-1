@@ -28,9 +28,24 @@ import {
 	TOTAL_SERIES_KEY,
 } from "./graph";
 import type { GraphGroupBy, GraphMetric, GraphModel } from "./graph";
+import { DEFAULT_TOP_N, MAX_TOP_N, MIN_TOP_N, STACK_GROUP_ORDER, STACK_METRIC_ORDER } from "./bars";
+import type { StackGroupBy, StackMetric } from "./bars";
+import { CACHE_CHART_ORDER, buildInputRates } from "./cache";
+import type { CacheChart, CacheGroupBy, InputRates } from "./cache";
 import {
+	cacheModelFor,
+	dailyStackFor,
+	planFor,
+	renderCacheView,
+	renderDailyView,
+	resolveCursor,
+} from "./dashboard";
+import type { Memo } from "./dashboard";
+import {
+	buildCacheCsv,
 	buildGraphCsv,
 	buildInsightsJson,
+	buildStackCsv,
 	buildTableCsv,
 	exportFileName,
 	parseExportDirSetting,
@@ -40,15 +55,22 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-type ViewMode = "table" | "insights" | "graph";
+type ViewMode = "daily" | "cache" | "graph" | "table" | "insights";
 
-const VIEW_CYCLE: ViewMode[] = ["graph", "table", "insights"];
+const VIEW_CYCLE: ViewMode[] = ["daily", "cache", "graph", "table", "insights"];
 
 const VIEW_LABELS: Record<ViewMode, string> = {
-	graph: "Graphs",
+	daily: "Daily",
+	cache: "Cache",
+	graph: "Trends",
 	table: "Table",
 	insights: "Insights",
 };
+
+/** Rows used by the frame around a view (borders, title, tabs, help). */
+const FRAME_ROWS = 12;
+/** Bound on memoized models; cleared wholesale when exceeded. */
+const MEMO_LIMIT = 96;
 
 // =============================================================================
 // Column Configuration
@@ -320,8 +342,8 @@ const TAB_LABELS: Record<TabName, string> = {
 };
 
 class UsageComponent {
-	private activeTab: TabName = "allTime";
-	private viewMode: ViewMode = "graph";
+	private activeTab: TabName = "last30Days";
+	private viewMode: ViewMode = "daily";
 	private data: UsageData;
 	private selectedIndex = 0;
 	private expanded = new Set<string>();
@@ -341,12 +363,101 @@ class UsageComponent {
 	private graphHidden = new Set<string>();
 	private graphLegendIndex = 0;
 
-	constructor(theme: Theme, data: UsageData, requestRender: () => void, done: () => void) {
+	// Daily (stacked bars) + Cache view state. The bucket cursor is shared so
+	// flipping between the two keeps the same day selected.
+	private dailyMetric: StackMetric = "cost";
+	private dailyGroupBy: StackGroupBy = "provider";
+	private dailyTopN = DEFAULT_TOP_N;
+	private cacheChart: CacheChart = "cost";
+	private cacheGroupBy: CacheGroupBy = "provider";
+	private bucketCursor: number | null = null;
+	private lastWidth = 100;
+	private getRows: () => number;
+
+	// Models are pure functions of (data, view state, width); memoize them so
+	// keypresses and re-renders never re-aggregate the hourly buckets.
+	private memoStore = new Map<string, unknown>();
+	private inputRates: InputRates | null = null;
+	private renderCache: { key: string; lines: string[] } | null = null;
+	private readonly memo: Memo = <T>(key: string, build: () => T): T => {
+		if (this.memoStore.has(key)) return this.memoStore.get(key) as T;
+		if (this.memoStore.size >= MEMO_LIMIT) this.memoStore.clear();
+		const value = build();
+		this.memoStore.set(key, value);
+		return value;
+	};
+
+	constructor(theme: Theme, data: UsageData, requestRender: () => void, done: () => void, getRows: () => number = () => 40) {
 		this.theme = theme;
 		this.requestRender = requestRender;
 		this.done = done;
 		this.data = data;
+		this.getRows = getRows;
 		this.updateProviderOrder();
+	}
+
+	private rates(): InputRates {
+		if (!this.inputRates) this.inputRates = buildInputRates(this.data.hourly);
+		return this.inputRates;
+	}
+
+	private dailyState() {
+		return {
+			period: this.activeTab,
+			metric: this.dailyMetric,
+			groupBy: this.dailyGroupBy,
+			topN: this.dailyTopN,
+			cursor: this.bucketCursor,
+		};
+	}
+
+	private cacheState() {
+		return { period: this.activeTab, chart: this.cacheChart, groupBy: this.cacheGroupBy, cursor: this.bucketCursor };
+	}
+
+	/** Move the shared bucket cursor; returns false when the view has no buckets. */
+	private moveCursor(delta: number | "start" | "end"): boolean {
+		const plan = planFor(this.memo, this.data, this.activeTab, this.lastWidth);
+		if (plan.buckets.length === 0) return false;
+		const current = resolveCursor(plan, this.bucketCursor);
+		if (delta === "start") this.bucketCursor = 0;
+		else if (delta === "end") this.bucketCursor = plan.buckets.length - 1;
+		else this.bucketCursor = Math.max(0, Math.min(plan.buckets.length - 1, current + delta));
+		return true;
+	}
+
+	private handleBarsInput(data: string): boolean {
+		if (matchesKey(data, "left") || data === "h") {
+			this.moveCursor(-1);
+		} else if (matchesKey(data, "right") || data === "l") {
+			this.moveCursor(1);
+		} else if (matchesKey(data, "home") || data === "0") {
+			this.moveCursor("start");
+		} else if (matchesKey(data, "end") || data === "$") {
+			this.moveCursor("end");
+		} else if (data === "t") {
+			this.bucketCursor = null; // back to "now"
+		} else if (this.viewMode === "daily" && matchesKey(data, "m")) {
+			const idx = STACK_METRIC_ORDER.indexOf(this.dailyMetric);
+			this.dailyMetric = STACK_METRIC_ORDER[(idx + 1) % STACK_METRIC_ORDER.length]!;
+		} else if (this.viewMode === "daily" && matchesKey(data, "g")) {
+			const idx = STACK_GROUP_ORDER.indexOf(this.dailyGroupBy);
+			this.dailyGroupBy = STACK_GROUP_ORDER[(idx + 1) % STACK_GROUP_ORDER.length]!;
+		} else if (this.viewMode === "daily" && (data === "+" || data === "=")) {
+			this.dailyTopN = Math.min(MAX_TOP_N, this.dailyTopN + 1);
+		} else if (this.viewMode === "daily" && (data === "-" || data === "_")) {
+			this.dailyTopN = Math.max(MIN_TOP_N, this.dailyTopN - 1);
+		} else if (this.viewMode === "cache" && matchesKey(data, "m")) {
+			const idx = CACHE_CHART_ORDER.indexOf(this.cacheChart);
+			this.cacheChart = CACHE_CHART_ORDER[(idx + 1) % CACHE_CHART_ORDER.length]!;
+		} else if (this.viewMode === "cache" && matchesKey(data, "g")) {
+			this.cacheGroupBy = this.cacheGroupBy === "provider" ? "model" : "provider";
+		} else {
+			return false;
+		}
+		this.exportNote = null;
+		this.requestRender();
+		return true;
 	}
 
 	private updateProviderOrder(): void {
@@ -469,19 +580,27 @@ class UsageComponent {
 			return;
 		}
 
-		if (matchesKey(data, "tab") || matchesKey(data, "right")) {
+		// Daily/Cache: ←→ move the bucket cursor, so periods are Tab/Shift+Tab only.
+		const barsView = this.viewMode === "daily" || this.viewMode === "cache";
+		if (barsView && this.handleBarsInput(data)) {
+			return;
+		}
+
+		if (matchesKey(data, "tab") || (!barsView && matchesKey(data, "right"))) {
 			const idx = TAB_ORDER.indexOf(this.activeTab);
 			this.activeTab = TAB_ORDER[(idx + 1) % TAB_ORDER.length]!;
+			this.bucketCursor = null;
 			this.updateProviderOrder();
 			this.exportNote = null;
 			this.requestRender();
-		} else if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) {
+		} else if (matchesKey(data, "shift+tab") || (!barsView && matchesKey(data, "left"))) {
 			const idx = TAB_ORDER.indexOf(this.activeTab);
 			this.activeTab = TAB_ORDER[(idx - 1 + TAB_ORDER.length) % TAB_ORDER.length]!;
+			this.bucketCursor = null;
 			this.updateProviderOrder();
 			this.exportNote = null;
 			this.requestRender();
-		} else if (this.viewMode === "graph") {
+		} else if (barsView || this.viewMode === "graph") {
 			// Graph-specific keys were handled above; swallow table-only keys.
 		} else if (this.viewMode === "table" && data === "/") {
 			this.tableFilterEditing = true;
@@ -564,7 +683,18 @@ class UsageComponent {
 		let name: string;
 		let content: string;
 		const stats = this.data[this.activeTab];
-		if (this.viewMode === "graph") {
+		if (this.viewMode === "daily") {
+			const slice = `${this.dailyMetric}-by-${this.dailyGroupBy}-top${this.dailyTopN}`;
+			name = exportFileName("daily", this.activeTab, slice, "csv", now);
+			content = buildStackCsv(dailyStackFor(this.memo, this.data, this.dailyState(), this.lastWidth));
+		} else if (this.viewMode === "cache") {
+			const plan = planFor(this.memo, this.data, this.activeTab, this.lastWidth);
+			name = exportFileName("cache", this.activeTab, `by-${this.cacheGroupBy}`, "csv", now);
+			content = buildCacheCsv(
+				cacheModelFor(this.memo, this.data, this.cacheState(), this.lastWidth, this.rates()),
+				plan.buckets.map((b) => b.startMs)
+			);
+		} else if (this.viewMode === "graph") {
 			const slice = `${this.graphCumulative ? "cumulative" : "per-bucket"}-${this.graphMetric}-by-${this.graphGroupBy}`;
 			name = exportFileName("graph", this.activeTab, slice, "csv", now);
 			content = buildGraphCsv(this.buildGraphModelForView());
@@ -608,6 +738,36 @@ class UsageComponent {
 	}
 
 	render(width: number): string[] {
+		this.lastWidth = width;
+		const rows = this.getRows();
+		const key = [
+			width,
+			rows,
+			this.viewMode,
+			this.activeTab,
+			this.dailyMetric,
+			this.dailyGroupBy,
+			this.dailyTopN,
+			this.cacheChart,
+			this.cacheGroupBy,
+			this.bucketCursor,
+			this.exportNote?.text ?? "",
+		].join("|");
+		if (this.viewMode === "daily" || this.viewMode === "cache") {
+			if (this.renderCache?.key === key) return this.renderCache.lines;
+			const budget = Math.max(rows - FRAME_ROWS, 20);
+			const body =
+				this.viewMode === "daily"
+					? renderDailyView(this.theme, this.data, this.dailyState(), width, budget, this.memo)
+					: renderCacheView(this.theme, this.data, this.cacheState(), width, budget, this.memo, this.rates());
+			const lines = clampLines(
+				[...this.renderTitle(width), ...this.renderTabs(width, getTableLayout(width)), ...body, ...this.renderHelp(width)],
+				width
+			);
+			this.renderCache = { key, lines };
+			return lines;
+		}
+
 		if (this.viewMode === "graph") {
 			return clampLines(
 				[...this.renderTitle(width), ...this.renderTabs(width, getTableLayout(width)), ...this.renderGraph(width), ...this.renderHelp(width)],
@@ -945,7 +1105,21 @@ class UsageComponent {
 			? [this.theme.fg(this.exportNote.ok ? "success" : "error", `${this.exportNote.ok ? "✓" : "✗"} ${this.exportNote.text}`), ""]
 			: [];
 		const variants =
-			this.viewMode === "graph"
+			this.viewMode === "daily"
+				? [
+						"[Tab] period  [←→] day  [t] today  [m] metric  [g] group  [+/-] top N  [e] export  [v] view  [q] close",
+						"[Tab] period  [←→] day  [m] metric  [g] group  [+/-] top N  [v] view  [q] close",
+						"[Tab] [←→] [m] [g] [+/-] [v] [q]",
+						"[q] close",
+				  ]
+				: this.viewMode === "cache"
+				? [
+						"[Tab] period  [←→] day  [t] today  [m] chart  [g] provider/model  [e] export  [v] view  [q] close",
+						"[Tab] period  [←→] day  [m] chart  [g] group  [v] view  [q] close",
+						"[Tab] [←→] [m] [g] [v] [q]",
+						"[q] close",
+				  ]
+				: this.viewMode === "graph"
 				? [
 						"[Tab/←→] period  [m] metric  [g] group  [c] cumulative  [↑↓/Enter] filter  [a] all  [e] export  [v] view  [q] close",
 						"[Tab] period  [m] metric  [g] group  [c] cumul  [↑↓/Enter] filter  [e] export  [v] view  [q] close",
@@ -972,7 +1146,9 @@ class UsageComponent {
 		return [...noteLines, this.theme.fg("dim", line)];
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.renderCache = null;
+	}
 	dispose(): void {}
 }
 
@@ -1043,7 +1219,13 @@ export default function (pi: ExtensionAPI) {
 				container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
 				container.addChild(new Spacer(1));
 
-				const usage = new UsageComponent(theme, data, () => tui.requestRender(), () => done());
+				const usage = new UsageComponent(
+					theme,
+					data,
+					() => tui.requestRender(),
+					() => done(),
+					() => tui.terminal.rows || 40
+				);
 
 				return {
 					render: (w: number) => {
@@ -1052,7 +1234,10 @@ export default function (pi: ExtensionAPI) {
 						const bottomBorder = theme.fg("border", "─".repeat(w));
 						return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
 					},
-					invalidate: () => container.invalidate(),
+					invalidate: () => {
+						container.invalidate();
+						usage.invalidate();
+					},
 					handleInput: (input: string) => usage.handleInput(input),
 					dispose: () => {},
 				};

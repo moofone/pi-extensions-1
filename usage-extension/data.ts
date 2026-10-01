@@ -25,6 +25,7 @@ import {
 	fallbackSessionId,
 	parseUsageFileBuffer,
 	pricedDevinCost,
+	splitCost,
 } from "./sources.ts";
 import type { ExtraSourceKind, ResolvedUsageSources, UsageFileKind } from "./sources.ts";
 
@@ -161,7 +162,51 @@ export interface HourlyCell {
 	cacheRead: number;
 	cacheWrite: number;
 	reasoning: number;
+	/** Cache-write tokens written with a 1h TTL (Anthropic extended cache). */
+	cacheWrite1h: number;
+	/** estCost split by token class (recorded breakdown, else catalog-apportioned). */
+	costInput: number;
+	costOutput: number;
+	costCacheRead: number;
+	costCacheWrite: number;
+	/** estCost no breakdown or catalog rate could attribute. */
+	costUnsplit: number;
+	/** Assistant turns classified as cache misses, by likely cause (see MissKind). */
+	missTtl: number;
+	missSwitch: number;
+	missPrefix: number;
+	missTtlCost: number;
+	missSwitchCost: number;
+	missPrefixCost: number;
 }
+
+export function emptyHourlyCell(): HourlyCell {
+	return {
+		messages: 0,
+		cost: 0,
+		estCost: 0,
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		reasoning: 0,
+		cacheWrite1h: 0,
+		costInput: 0,
+		costOutput: 0,
+		costCacheRead: 0,
+		costCacheWrite: 0,
+		costUnsplit: 0,
+		missTtl: 0,
+		missSwitch: 0,
+		missPrefix: 0,
+		missTtlCost: 0,
+		missSwitchCost: 0,
+		missPrefixCost: 0,
+	};
+}
+
+/** Likely cause of a cache miss on an assistant turn; null when not a miss. */
+export type MissKind = "ttl" | "switch" | "prefix";
 
 /** Composite key: `${provider}\u0000${model}\u0000${thinkingLevel}` */
 export type HourlyKey = string;
@@ -240,6 +285,13 @@ export interface SessionMessage extends UsageAmount {
 	 * so such messages are excluded from prefix-change cache-miss accounting.
 	 */
 	afterCompaction: boolean;
+	/** Recorded per-class cost (Pi `usage.cost.*`); absent for sources without a breakdown. */
+	costInput?: number;
+	costOutput?: number;
+	costCacheRead?: number;
+	costCacheWrite?: number;
+	/** Cache-write tokens with a 1h TTL (Pi `usage.cacheWrite1h`). */
+	cacheWrite1h?: number;
 }
 
 export interface ChildToolUsage {
@@ -724,6 +776,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 					const msg = entry.message;
 					if (msg.usage && msg.provider && msg.model) {
 						const fallbackTs = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
+						const costParts = msg.usage.cost && typeof msg.usage.cost === "object" ? msg.usage.cost : null;
 						messages.push({
 							provider: msg.provider,
 							model: msg.model,
@@ -738,6 +791,11 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 							reasoning: msg.usage.reasoning || 0,
 							timestamp: msg.timestamp || (Number.isNaN(fallbackTs) ? 0 : fallbackTs),
 							afterCompaction: compactionPending,
+							costInput: finiteNumber(costParts?.input),
+							costOutput: finiteNumber(costParts?.output),
+							costCacheRead: finiteNumber(costParts?.cacheRead),
+							costCacheWrite: finiteNumber(costParts?.cacheWrite),
+							cacheWrite1h: finiteNumber(msg.usage.cacheWrite1h),
 						});
 						compactionPending = false;
 					}
@@ -761,7 +819,12 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 // On-disk cache
 // =============================================================================
 
-const CACHE_VERSION = 6;
+// v7: assistant tuples may carry the recorded per-class cost split + 1h cache
+// writes. Those five trailing fields are omitted when all zero (auxiliary and
+// extra-source rows), so a tuple has either the base or the extended length.
+const CACHE_VERSION = 7;
+const MESSAGE_TUPLE_BASE_LENGTH = 13;
+const MESSAGE_TUPLE_LENGTH = 18;
 
 type CachedMessageTuple = [
 	providerIdx: number,
@@ -777,6 +840,11 @@ type CachedMessageTuple = [
 	afterCompaction: 0 | 1,
 	auxiliary: 0 | 1,
 	sourceIdIdx: number,
+	costInput?: number,
+	costOutput?: number,
+	costCacheRead?: number,
+	costCacheWrite?: number,
+	cacheWrite1h?: number,
 ];
 
 type CachedUsageTuple = [
@@ -845,7 +913,7 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
 		const messages: SessionMessage[] = [];
 		let valid = true;
 		for (const tuple of entry.messages) {
-			if (!Array.isArray(tuple) || tuple.length !== 13) {
+			if (!Array.isArray(tuple) || (tuple.length !== MESSAGE_TUPLE_LENGTH && tuple.length !== MESSAGE_TUPLE_BASE_LENGTH)) {
 				valid = false;
 				break;
 			}
@@ -877,6 +945,11 @@ export async function loadUsageCache(cachePath: string): Promise<Map<string, Cac
 				timestamp: Number(tuple[7]) || 0,
 				reasoning: Number(tuple[9]) || 0,
 				afterCompaction: tuple[10] === 1,
+				costInput: Number(tuple[13]) || 0,
+				costOutput: Number(tuple[14]) || 0,
+				costCacheRead: Number(tuple[15]) || 0,
+				costCacheWrite: Number(tuple[16]) || 0,
+				cacheWrite1h: Number(tuple[17]) || 0,
 			});
 		}
 		if (!valid) continue;
@@ -944,6 +1017,14 @@ function cacheUsageAmount(usage: UsageAmount): CachedUsageTuple {
 	return [usage.cost, usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.reasoning];
 }
 
+/**
+ * Per-class costs are float products like 0.10876000000000001; rounding to a
+ * nano-dollar keeps the persisted cache compact at no visible precision cost.
+ */
+function roundNanoUsd(value: number): number {
+	return Math.round(value * 1e9) / 1e9;
+}
+
 export async function saveUsageCache(cachePath: string, states: Map<string, CachedFileState>): Promise<void> {
 	const names: string[] = [];
 	const nameIndex = new Map<string, number>();
@@ -964,21 +1045,32 @@ export async function saveUsageCache(cachePath: string, states: Map<string, Cach
 			mtimeMs: state.mtimeMs,
 			sessionId: state.parsed.sessionId,
 			cwd: state.parsed.cwd,
-			messages: state.parsed.messages.map((m): CachedMessageTuple => [
-				intern(m.provider),
-				intern(m.model),
-				m.cost,
-				m.input,
-				m.output,
-				m.cacheRead,
-				m.cacheWrite,
-				m.timestamp,
-				intern(m.thinkingLevel),
-				m.reasoning,
-				m.afterCompaction ? 1 : 0,
-				m.source === "auxiliary" ? 1 : 0,
-				intern(m.source === "auxiliary" ? m.sourceId : ""),
-			]),
+			messages: state.parsed.messages.map((m): CachedMessageTuple => {
+				const tuple: CachedMessageTuple = [
+					intern(m.provider),
+					intern(m.model),
+					m.cost,
+					m.input,
+					m.output,
+					m.cacheRead,
+					m.cacheWrite,
+					m.timestamp,
+					intern(m.thinkingLevel),
+					m.reasoning,
+					m.afterCompaction ? 1 : 0,
+					m.source === "auxiliary" ? 1 : 0,
+					intern(m.source === "auxiliary" ? m.sourceId : ""),
+				];
+				const extras = [
+					roundNanoUsd(m.costInput ?? 0),
+					roundNanoUsd(m.costOutput ?? 0),
+					roundNanoUsd(m.costCacheRead ?? 0),
+					roundNanoUsd(m.costCacheWrite ?? 0),
+					m.cacheWrite1h ?? 0,
+				] as const;
+				if (extras.some((v) => v !== 0)) tuple.push(...extras);
+				return tuple;
+			}),
 			toolUsages: state.parsed.toolUsages.map((tool): CachedToolUsageTuple => [
 				intern(tool.sourceId),
 				tool.timestamp,
@@ -1085,7 +1177,7 @@ function emptyUsageData(bounds: PeriodBounds): UsageData {
 
 const HOUR_MS = 3_600_000;
 
-function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg: SessionMessage): void {
+function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg: SessionMessage, miss: MissKind | null): void {
 	if (msg.timestamp <= 0) return; // Unknown time can't be placed on a time axis.
 	const hour = Math.floor(msg.timestamp / HOUR_MS) * HOUR_MS;
 	let bucket = hourly.get(hour);
@@ -1096,17 +1188,59 @@ function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg
 	const key = makeHourlyKey(msg.provider, msg.model, msg.thinkingLevel);
 	let cell = bucket.get(key);
 	if (!cell) {
-		cell = { messages: 0, cost: 0, estCost: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 };
+		cell = emptyHourlyCell();
 		bucket.set(key, cell);
 	}
 	if (msg.source === "assistant") cell.messages++;
+	const estCost = freeTierUsd(msg.provider, msg.model, msg);
 	cell.cost += msg.cost;
-	cell.estCost += freeTierUsd(msg.provider, msg.model, { ...msg, cost: msg.cost });
+	cell.estCost += estCost;
 	cell.input += msg.input;
 	cell.output += msg.output;
 	cell.cacheRead += msg.cacheRead;
 	cell.cacheWrite += msg.cacheWrite;
 	cell.reasoning += msg.reasoning;
+	cell.cacheWrite1h += msg.cacheWrite1h ?? 0;
+	const parts = splitCost(msg.provider, msg.model, msg, estCost, {
+		input: msg.costInput ?? 0,
+		output: msg.costOutput ?? 0,
+		cacheRead: msg.costCacheRead ?? 0,
+		cacheWrite: msg.costCacheWrite ?? 0,
+	});
+	cell.costInput += parts.input;
+	cell.costOutput += parts.output;
+	cell.costCacheRead += parts.cacheRead;
+	cell.costCacheWrite += parts.cacheWrite;
+	cell.costUnsplit += parts.unsplit;
+	if (miss === "ttl") {
+		cell.missTtl++;
+		cell.missTtlCost += msg.cost;
+	} else if (miss === "switch") {
+		cell.missSwitch++;
+		cell.missSwitchCost += msg.cost;
+	} else if (miss === "prefix") {
+		cell.missPrefix++;
+		cell.missPrefixCost += msg.cost;
+	}
+}
+
+/**
+ * Classify an assistant turn as a cache miss: the previous turn had a large
+ * context but this one read (almost) nothing from cache. Compaction changes
+ * the prefix legitimately, so post-compaction turns never count.
+ */
+function classifyMiss(msg: SessionMessage, mm: MessageMeta, cacheReporting: ReadonlySet<string>): MissKind | null {
+	if (msg.source !== "assistant" || msg.afterCompaction) return null;
+	// Providers that never report cache tokens (e.g. Cursor) would read as a
+	// miss on every large turn; with no cache data there is nothing to classify.
+	// Keyed by provider: a model used once after a switch has no history of its own.
+	if (!cacheReporting.has(msg.provider)) return null;
+	if (mm.prevCtx < MISS_MIN_PREV_CONTEXT) return null;
+	if (msg.cacheRead >= Math.min(MISS_MAX_CACHE_READ, 0.3 * mm.prevCtx)) return null;
+	if (mm.gapMs > TTL_GAP_MS) return "ttl";
+	if (mm.gapMs >= 0 && mm.modelSwitched) return "switch";
+	if (mm.gapMs >= 0) return "prefix";
+	return null;
 }
 
 // Helper to accumulate stats into a target
@@ -1159,7 +1293,8 @@ function addMessagesToUsageData(
 	lastWeekStartMs: number,
 	last30DaysStartMs: number,
 	rawByPeriod: Record<TabName, PeriodRawData>,
-	costByDayIdx: Map<number, number>
+	costByDayIdx: Map<number, number>,
+	cacheReporting: ReadonlySet<string> = new Set()
 ): void {
 	const sessionContributed = { today: false, thisWeek: false, lastWeek: false, last30Days: false, allTime: false };
 
@@ -1176,7 +1311,8 @@ function addMessagesToUsageData(
 			costByDayIdx.set(dayIdx, (costByDayIdx.get(dayIdx) ?? 0) + msg.cost);
 		}
 
-		addToHourlyBuckets(data.hourly, msg);
+		const miss = classifyMiss(msg, mm, cacheReporting);
+		addToHourlyBuckets(data.hourly, msg, miss);
 
 		const periods = getPeriodsForTimestamp(msg.timestamp, todayMs, weekStartMs, lastWeekStartMs, last30DaysStartMs);
 		const tokens = {
@@ -1241,15 +1377,9 @@ function addMessagesToUsageData(
 				raw.ctxLow.messages++;
 			}
 			if (mm.isSessionStart) raw.upfrontCost += msg.cost;
-			if (
-				!msg.afterCompaction &&
-				mm.prevCtx >= MISS_MIN_PREV_CONTEXT &&
-				msg.cacheRead < Math.min(MISS_MAX_CACHE_READ, 0.3 * mm.prevCtx)
-			) {
-				if (mm.gapMs > TTL_GAP_MS) raw.ttlMissCost += msg.cost;
-				else if (mm.gapMs >= 0 && mm.modelSwitched) raw.modelSwitchMissCost += msg.cost;
-				else if (mm.gapMs >= 0) raw.prefixMissCost += msg.cost;
-			}
+			if (miss === "ttl") raw.ttlMissCost += msg.cost;
+			else if (miss === "switch") raw.modelSwitchMissCost += msg.cost;
+			else if (miss === "prefix") raw.prefixMissCost += msg.cost;
 			raw.reasoningTokens += msg.reasoning;
 			raw.outputTokens += msg.output;
 			raw.cacheReadTokens += msg.cacheRead;
@@ -1592,6 +1722,12 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 	const seenHashes = new Set<string>();
 	const scannedSessions = buildScannedSessionIndex(current);
 	const resolvedToolChildren = resolvedToolChildIdentities(current, scannedSessions);
+	const cacheReporting = new Set<string>();
+	for (const state of current.values()) {
+		for (const m of state.parsed.messages) {
+			if (m.cacheRead > 0 || m.cacheWrite > 0) cacheReporting.add(canonicalProvider(m.provider));
+		}
+	}
 	let processedFiles = 0;
 
 	for (const filePath of filePaths) {
@@ -1656,7 +1792,8 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 			lastWeekStartMs,
 			last30DaysStartMs,
 			rawByPeriod,
-			costByDayIdx
+			costByDayIdx,
+			cacheReporting
 		);
 	}
 

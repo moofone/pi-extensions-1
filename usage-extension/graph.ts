@@ -84,6 +84,8 @@ export interface GraphModel {
 	domainEndMs: number;
 	/** Max point value across visible series (y-axis scale). */
 	yMax: number;
+	/** Bottom of the y-axis; 0 when omitted. Used by auto-ranged percent charts. */
+	yMin?: number;
 	/** Sum of totals across grouped (non-total) series, for legend percentages. */
 	groupedTotal: number;
 }
@@ -316,13 +318,14 @@ const DOT_BITS = [
  */
 export function renderChart(model: GraphModel, options: ChartRenderOptions): string[] {
 	const colorize: ChartColorize = options.colorize ?? ((_i, text) => text);
+	const yMin = model.yMin ?? 0;
 	const plotHeightForLabels = Math.max(options.height, 4);
 	const midRowForLabels = Math.floor((plotHeightForLabels - 1) / 2);
-	const midValue = (model.yMax * (plotHeightForLabels - 1 - midRowForLabels)) / (plotHeightForLabels - 1);
+	const midValue = yMin + ((model.yMax - yMin) * (plotHeightForLabels - 1 - midRowForLabels)) / (plotHeightForLabels - 1);
 	const yLabelWidth = Math.max(
 		options.formatValue(model.yMax).length,
 		options.formatValue(midValue).length,
-		options.formatValue(0).length
+		options.formatValue(yMin).length
 	);
 	const axisWidth = yLabelWidth + 2; // label + " ┤" / " │"
 	const plotWidth = Math.max(options.width - axisWidth, 10);
@@ -334,7 +337,7 @@ export function renderChart(model: GraphModel, options: ChartRenderOptions): str
 	const cellMasks: number[][] = Array.from({ length: plotHeight }, () => new Array<number>(plotWidth).fill(0));
 	const cellOwner: number[][] = Array.from({ length: plotHeight }, () => new Array<number>(plotWidth).fill(-1));
 
-	const yMax = model.yMax > 0 ? model.yMax : 1;
+	const yRange = model.yMax - yMin > 0 ? model.yMax - yMin : 1;
 	const bucketCount = model.bucketStarts.length;
 
 	const plot = (seriesIndex: number, points: number[], firstIdx: number, lastIdx: number) => {
@@ -342,8 +345,16 @@ export function renderChart(model: GraphModel, options: ChartRenderOptions): str
 		let prevX = -1;
 		let prevY = -1;
 		for (let i = firstIdx; i <= lastIdx; i++) {
+			const value = points[i]!;
+			if (!Number.isFinite(value)) {
+				// Gap (e.g. no prompt input that bucket): break the line.
+				prevX = -1;
+				prevY = -1;
+				continue;
+			}
 			const x = bucketCount === 1 ? dotW - 1 : Math.round((i / (bucketCount - 1)) * (dotW - 1));
-			const y = Math.round((1 - (points[i]! / yMax)) * (dotH - 1));
+			const clamped = Math.min(Math.max(value, yMin), model.yMax);
+			const y = Math.round((1 - (clamped - yMin) / yRange) * (dotH - 1));
 			if (prevX >= 0) {
 				// Connect with a vertical-stepped segment for continuity.
 				const steps = Math.max(Math.abs(x - prevX), Math.abs(y - prevY), 1);
@@ -387,7 +398,7 @@ export function renderChart(model: GraphModel, options: ChartRenderOptions): str
 		let label = "";
 		if (row === 0) label = options.formatValue(model.yMax);
 		else if (row === midRow && plotHeight > 2) label = options.formatValue(midValue);
-		else if (row === plotHeight - 1) label = options.formatValue(0);
+		else if (row === plotHeight - 1) label = options.formatValue(yMin);
 		const axisChar = label ? "┤" : "│";
 		let line = colorize(-1, label.padStart(yLabelWidth) + " " + axisChar);
 		// Batch consecutive cells with the same owning series into one colorize

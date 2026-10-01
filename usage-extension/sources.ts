@@ -359,7 +359,20 @@ const PROVIDER_RATES: Record<string, TokenRates> = {
 
 const ZERO_RATES: TokenRates = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 
+const ratesCache = new Map<string, TokenRates>();
+
+/** Memoized: called per message during aggregation (~1M times on big histories). */
 function ratesFor(provider: string, model: string): TokenRates {
+	const key = provider + "\u0000" + model;
+	let rates = ratesCache.get(key);
+	if (!rates) {
+		rates = lookupRates(provider, model);
+		ratesCache.set(key, rates);
+	}
+	return rates;
+}
+
+function lookupRates(provider: string, model: string): TokenRates {
 	// Catalog keys are lowercase; session logs mix case (zcode-re records
 	// "GLM-5.3-Flash" / "GLM-5.3"), so match case-insensitively.
 	const lowered = model.toLowerCase();
@@ -408,6 +421,53 @@ export function estimateUsd(provider: string, model: string, amount: UsageAmount
 			amount.cacheWrite * rates.cacheWrite) /
 		1_000_000
 	);
+}
+
+/** USD per token for fresh (uncached) input from the catalog; 0 when unknown. */
+export function catalogInputRate(provider: string, model: string): number {
+	return ratesFor(provider, model).input / 1_000_000;
+}
+
+/** Cost split by token class. `unsplit` holds cost no rate table could attribute. */
+export interface CostParts {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	unsplit: number;
+}
+
+/**
+ * Split `total` USD across token classes. A recorded per-class breakdown wins
+ * (rescaled to `total` when the total was repriced, e.g. free-tier list price);
+ * otherwise catalog rates apportion it; with no rates it stays `unsplit`.
+ */
+export function splitCost(
+	provider: string,
+	model: string,
+	amount: UsageAmount,
+	total: number,
+	recorded?: { input: number; output: number; cacheRead: number; cacheWrite: number }
+): CostParts {
+	if (total <= 0) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, unsplit: 0 };
+	let input: number;
+	let output: number;
+	let cacheRead: number;
+	let cacheWrite: number;
+	const recordedSum = recorded ? recorded.input + recorded.output + recorded.cacheRead + recorded.cacheWrite : 0;
+	if (recorded && recordedSum > 0) {
+		({ input, output, cacheRead, cacheWrite } = recorded);
+	} else {
+		const rates = ratesFor(provider, model);
+		input = amount.input * rates.input;
+		output = amount.output * rates.output;
+		cacheRead = amount.cacheRead * rates.cacheRead;
+		cacheWrite = amount.cacheWrite * rates.cacheWrite;
+	}
+	const sum = input + output + cacheRead + cacheWrite;
+	if (sum <= 0) return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, unsplit: total };
+	const k = total / sum;
+	return { input: input * k, output: output * k, cacheRead: cacheRead * k, cacheWrite: cacheWrite * k, unsplit: 0 };
 }
 
 /** Pi's Devin adapter can record $0 for paid DeepSeek despite token usage.
