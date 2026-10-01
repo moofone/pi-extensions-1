@@ -22,7 +22,7 @@ export async function run({ root, dir, sources, now, out, stallProbe, legacyCach
 	const legacyCopy = join(dir, "index-legacy-copy.json");
 	rmSync(storeDir, { recursive: true, force: true });
 	if (existsSync(legacyCache)) copyFileSync(legacyCache, legacyCopy);
-	const options = { sessionsDir, sources, storeDir, legacyCachePath: existsSync(legacyCopy) ? legacyCopy : null, worker: false, watch: false };
+	const options = { sessionsDir, sources, storeDir, legacyCachePath: existsSync(legacyCopy) ? legacyCopy : null, worker: false };
 	const core = new UsageIndexCore(options);
 	let data;
 	{
@@ -72,28 +72,58 @@ process.exit(0);
 		out("index.fresh-warm", t0, { ...parsed, ms: parsed.ms ?? Math.round(performance.now() - t0), childTotalMs: Math.round(performance.now() - t0) });
 	}
 
-	// --- warm snapshot on the live core --------------------------------------------------------------------------
+	// --- warm snapshot on the live (watching) core -----------------------------------------------------------------
+	// index.warm-nothing-dirty: refresh() alone with nothing dirty must skip the filesystem; index.warm: the full
+	// snapshot (refresh + ledger.snapshot). Live sessions may dirty a few paths in between (reported).
 	{
+		await core.refresh(); // absorb events that arrived during the cold build
+		const sweeps = core.fullSweeps;
+		const checked = core.dirtyPathsChecked;
+		let t0 = performance.now();
+		await core.refresh();
+		out("index.warm-nothing-dirty", t0, { fullSweeps: core.fullSweeps - sweeps, dirtyChecked: core.dirtyPathsChecked - checked });
 		const stop = stallProbe();
-		const t0 = performance.now();
+		t0 = performance.now();
 		await core.snapshot({ now });
-		out("index.warm", t0, { maxStallMs: stop() });
+		out("index.warm", t0, { maxStallMs: stop(), fullSweeps: core.fullSweeps - sweeps });
 	}
 
-	// --- append on a synthetic history ---------------------------------------------------------------------------
+	// --- watched append on a synthetic history ---------------------------------------------------------------------
 	{
 		const history = join(dir, "append-history");
 		rmSync(history, { recursive: true, force: true });
 		mkdirSync(history, { recursive: true });
 		const files = makeHistory(history, { seed: 5, sessions: 400, now: now.getTime() });
 		rmSync(join(dir, "append-store"), { recursive: true, force: true });
-		const appendCore = new UsageIndexCore({ sessionsDir: history, storeDir: join(dir, "append-store"), legacyCachePath: null, worker: false, watch: false });
+		const appendCore = new UsageIndexCore({ sessionsDir: history, storeDir: join(dir, "append-store"), legacyCachePath: null, worker: false });
 		await appendCore.snapshot({ now });
-		appendTurns(files[Math.floor(files.length / 2)], 5, 123, now.getTime() - 60_000);
+		await new Promise((r) => setTimeout(r, 500));
+		await appendCore.snapshot({ now });
+		const target = files[Math.floor(files.length / 2)];
+		const sweeps = appendCore.fullSweeps;
+		appendTurns(target, 5, 123, now.getTime() - 60_000);
+		await new Promise((r) => setTimeout(r, 200)); // fs event delivery
 		const t0 = performance.now();
 		await appendCore.snapshot({ now });
-		out("index.append", t0, { files: files.length });
+		out("index.append", t0, { files: files.length, fullSweeps: appendCore.fullSweeps - sweeps, dirtyChecked: appendCore.dirtyPathsChecked });
 		await appendCore.dispose();
+
+		// Same through the worker host: append → subscriber notified (watch debounce + refresh) → snapshot.
+		const { getUsageIndex } = await import(join(root, "usage-extension/index/client.ts"));
+		const index = getUsageIndex({ sessionsDir: history, storeDir: null, legacyCachePath: null, worker: true, parseWorkers: 0 });
+		await index.snapshot({ now });
+		let fired = null;
+		const unsubscribe = index.subscribe(() => (fired ??= performance.now()));
+		await new Promise((r) => setTimeout(r, 800));
+		const a0 = performance.now();
+		appendTurns(files[1], 5, 321, now.getTime() - 30_000);
+		for (let i = 0; i < 400 && fired === null; i++) await new Promise((r) => setTimeout(r, 10));
+		const notifyMs = fired === null ? null : Math.round(fired - a0);
+		const t1 = performance.now();
+		await index.snapshot({ now });
+		out("index.watched-append", a0, { notifyMs, snapshotAfterNotifyMs: Math.round(performance.now() - t1) });
+		unsubscribe();
+		await index.dispose();
 		rmSync(history, { recursive: true, force: true });
 	}
 

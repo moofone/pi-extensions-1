@@ -293,3 +293,54 @@ test("vanished sessions dir and mtime-only touches are handled", async (t) => {
 	rmSync(f.sessionsDir, { recursive: true });
 	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "gone");
 });
+
+test("watched core: a warm refresh touches no filesystem; appends, new files and deletes are found from dirty paths", async (t) => {
+	const f = fixture(t, 10, 13);
+	const core = new UsageIndexCore({ sessionsDir: f.sessionsDir, storeDir: null, legacyCachePath: null, worker: false, parseWorkers: 0 });
+	t.after(() => core.dispose());
+	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "first");
+	assert.equal(core.fullSweeps, 1);
+	await sleep(500); // FSEvents may replay the fixture's own creation events; absorb them
+	await core.snapshot({ now: NOW });
+	const baseline = core.dirtyPathsChecked;
+	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "warm");
+	assert.deepEqual([core.fullSweeps, core.dirtyPathsChecked], [1, baseline], "nothing dirty → no discovery, no stats");
+
+	appendTurns(f.files[0], 4, 71, NOW.getTime() - 800_000);
+	const fresh = join(f.sessionsDir, "--Users-me-Dev-git-proj1--", "late.jsonl");
+	writeFileSync(fresh, sessionLines({ id: "late", cwd: "/Users/me/Dev/git/proj1", start: NOW.getTime() - 2_000_000, turns: 5, seed: 909 }).text);
+	rmSync(f.files[3]);
+	await sleep(400);
+	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "dirty paths");
+	assert.equal(core.fullSweeps, 1, "still no second discovery");
+	assert.ok(core.dirtyPathsChecked >= baseline + 3);
+});
+
+test("watched core: a full sweep is repeated when the last one is older than the sweep interval", async (t) => {
+	const f = fixture(t, 4);
+	const core = new UsageIndexCore({ sessionsDir: f.sessionsDir, storeDir: null, legacyCachePath: null, worker: false, parseWorkers: 0 }, { sweepIntervalMs: 200 });
+	t.after(() => core.dispose());
+	await core.snapshot({ now: NOW });
+	await sleep(350);
+	await core.snapshot({ now: NOW });
+	assert.equal(core.fullSweeps, 2);
+	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "after sweep");
+});
+
+test("watched core: new and vanished directories are expanded from dirty paths, not swept", async (t) => {
+	const f = fixture(t, 5, 17);
+	const core = new UsageIndexCore({ sessionsDir: f.sessionsDir, storeDir: null, legacyCachePath: null, worker: false, parseWorkers: 0 });
+	t.after(() => core.dispose());
+	await core.snapshot({ now: NOW });
+	await sleep(500);
+	await core.snapshot({ now: NOW });
+	const sweeps = core.fullSweeps;
+	mkdirSync(join(f.sessionsDir, "brand-new-project"), { recursive: true });
+	writeFileSync(join(f.sessionsDir, "brand-new-project", "x.jsonl"), sessionLines({ id: "nx", cwd: "/x", start: NOW.getTime() - 60_000, turns: 2, seed: 5 }).text);
+	await sleep(400);
+	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "new dir");
+	rmSync(join(f.sessionsDir, "--Users-me-Dev-git-proj0--"), { recursive: true });
+	await sleep(400);
+	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "removed dir");
+	assert.equal(core.fullSweeps, sweeps);
+});

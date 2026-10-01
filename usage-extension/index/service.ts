@@ -10,8 +10,8 @@
  * Must load under Node's native type stripping (explicit .ts imports, `import type`, no enums).
  */
 import { availableParallelism } from "node:os";
-import { stat } from "node:fs/promises";
-import { join, sep } from "node:path";
+import { lstat, readdir, stat } from "node:fs/promises";
+import { basename, join, sep } from "node:path";
 import { getAgentDir } from "../data.ts";
 import type { UsageData } from "../data.ts";
 import { buildUsageRollup } from "../native.ts";
@@ -24,7 +24,7 @@ import { ParsePool } from "./pool.ts";
 import { applyParseDelta, parseFile } from "./parse.ts";
 import { openIndexStore } from "./store.ts";
 import type { OpenStoreOptions } from "./store.ts";
-import { UsageWatcher } from "./watch.ts";
+import { UsageWatcher, WATCH_DEBOUNCE_MS, WATCH_SWEEP_MS } from "./watch.ts";
 import type { DiscoveredFile, FileRecord, IndexStore, ParseOutcome, SnapshotOptions, UsageIndexOptions } from "./types.ts";
 
 /** Batches of at least this many changed files go to the parse pool. */
@@ -41,6 +41,18 @@ export interface CoreInternalOptions {
 	flushDebounceMs?: number;
 	/** Minimum changed files before the parse pool is used (default 200). */
 	poolThreshold?: number;
+	/** A full discovery is repeated when the last one is older than this (default 60 s). */
+	sweepIntervalMs?: number;
+	/** Debounce of watcher-driven background refreshes (default 750 ms). */
+	watchDebounceMs?: number;
+	/** More dirty paths than this → full discovery instead of per-path stats (default 2000). */
+	maxDirtyPaths?: number;
+}
+
+interface Changes {
+	changedFiles: DiscoveredFile[];
+	removed: string[];
+	present: Set<string> | null;
 }
 
 export interface RefreshResult {
@@ -81,6 +93,24 @@ function makeKindOf(sessionsDir: string, sources: ResolvedUsageSources): (path: 
 	};
 }
 
+/** Whether `path` is a source file under discovery's rules, and of which kind (null: not one). */
+function makeFileKind(sessionsDir: string, sources: ResolvedUsageSources): (path: string) => UsageFileKind | null {
+	const under = (path: string, root: string) => path.startsWith(root.endsWith(sep) ? root : root + sep);
+	const openCodeRoot = (root: string) => {
+		const n = root.replace(/\/+$/, "");
+		return n.endsWith("/storage/message") ? n : n.endsWith("/storage") ? join(n, "message") : join(n, "storage", "message");
+	};
+	return (path) => {
+		const name = basename(path);
+		if (name.endsWith(".jsonl") && under(path, sessionsDir)) return "pi";
+		if (sources.claudeCode.enabled && name.endsWith(".jsonl") && sources.claudeCode.roots.some((r) => under(path, r))) return "claude-code";
+		if (sources.codexCli.enabled && name.endsWith(".jsonl") && sources.codexCli.roots.some((r) => under(path, r))) return "codex-cli";
+		if (sources.grokBuild.enabled && name === "updates.jsonl" && sources.grokBuild.roots.some((r) => under(path, r))) return "grok-build";
+		if (sources.opencodeGo.enabled && name.startsWith("msg_") && name.endsWith(".json") && sources.opencodeGo.roots.some((r) => under(path, openCodeRoot(r)))) return "opencode-go";
+		return null;
+	};
+}
+
 export class UsageIndexCore {
 	readonly options: Required<Pick<UsageIndexOptions, "sessionsDir">> & UsageIndexOptions;
 	private readonly sources: ResolvedUsageSources;
@@ -98,6 +128,17 @@ export class UsageIndexCore {
 	private flushTimer: ReturnType<typeof setTimeout> | null = null;
 	private watcher: UsageWatcher | null = null;
 	private disposed = false;
+	/** Watch for the core's whole life (options.watch !== false) and refresh from dirty paths. */
+	private readonly live: boolean;
+	private readonly fileKind: (path: string) => UsageFileKind | null;
+	private dirty = new Set<string>();
+	private dirtyDirs = new Set<string>();
+	private sweepNeeded = true;
+	private lastFullAt = 0;
+	private onChanged: (() => void) | null = null;
+	/** Diagnostics: full discoveries run / dirty paths stat'ed so far. */
+	fullSweeps = 0;
+	dirtyPathsChecked = 0;
 
 	constructor(options: UsageIndexOptions = {}, internal: CoreInternalOptions = {}) {
 		const agentDir = options.agentDir ?? getAgentDir();
@@ -109,7 +150,12 @@ export class UsageIndexCore {
 			persistRollup: internal.persistRollup ?? true,
 			flushDebounceMs: internal.flushDebounceMs ?? FLUSH_DEBOUNCE_MS,
 			poolThreshold: internal.poolThreshold ?? POOL_THRESHOLD_FILES,
+			sweepIntervalMs: internal.sweepIntervalMs ?? WATCH_SWEEP_MS,
+			watchDebounceMs: internal.watchDebounceMs ?? WATCH_DEBOUNCE_MS,
+			maxDirtyPaths: internal.maxDirtyPaths ?? 2000,
 		};
+		this.live = options.watch !== false;
+		this.fileKind = makeFileKind(this.options.sessionsDir, this.sources);
 		// `kindOf` is an optional store capability; harmless when the store ignores it.
 		const storeOptions: OpenStoreOptions & { kindOf?: (path: string) => UsageFileKind } = {
 			legacyCachePath: this.legacyCachePath,
@@ -130,6 +176,125 @@ export class UsageIndexCore {
 	private discover(signal?: AbortSignal): Promise<DiscoveredFile[] | null> {
 		const options = { sessionsDir: this.options.sessionsDir, sources: this.sources, signal };
 		return this.discoverer ? this.discoverer.discover(options) : discoverModule.discoverFiles(options);
+	}
+
+	private ensureWatcher(): UsageWatcher | null {
+		if (this.watcher || this.disposed) return this.watcher;
+		const watcher = new UsageWatcher({
+			roots: watchRoots(this.options.sessionsDir, this.sources),
+			debounceMs: this.internal.watchDebounceMs,
+			sweepMs: this.internal.sweepIntervalMs,
+			onEvent: (path) => {
+				if (path === null) this.sweepNeeded = true;
+				else if (path.endsWith(".jsonl") || path.endsWith(".json")) {
+					this.dirty.add(path);
+					if (this.dirty.size > this.internal.maxDirtyPaths) this.sweepNeeded = true;
+				}
+				else if (!basename(path).includes(".")) {
+					this.dirtyDirs.add(path); // probably a directory appeared/moved/vanished
+					if (this.dirtyDirs.size > this.internal.maxDirtyPaths) this.sweepNeeded = true;
+				}
+			},
+			onError: () => {
+				this.sweepNeeded = true;
+			},
+		});
+		this.watcher = watcher;
+		this.sweepNeeded = true; // events before this point were not seen
+		watcher.start();
+		return watcher;
+	}
+
+	/** A directory event: add the files it may have brought (unknown source files below it) or taken away
+	 * (known records below a vanished directory) to the dirty set. */
+	private async expandDirectory(dir: string, dirty: Set<string>): Promise<void> {
+		let isDir = false;
+		try {
+			isDir = (await lstat(dir)).isDirectory();
+		} catch {
+			// vanished
+		}
+		if (!isDir) {
+			const prefix = dir + sep;
+			for (const path of this.records.keys()) if (path.startsWith(prefix)) dirty.add(path);
+			return;
+		}
+		try {
+			for (const entry of await readdir(dir, { recursive: true, withFileTypes: true })) {
+				if (!entry.isFile()) continue;
+				const path = join(entry.parentPath, entry.name);
+				if (!this.records.has(path) && this.fileKind(path)) dirty.add(path);
+			}
+		} catch {
+			this.sweepNeeded = true;
+		}
+	}
+
+	/** New/changed/removed files: a full discovery (first use, sweep needed, stale, or no healthy watch) or
+	 * just the paths the watcher reported dirty. `present` is the full file set (null for dirty-only). */
+	private async findChanges(signal?: AbortSignal): Promise<Changes | null> {
+		const watcher = this.live ? this.watcher : null;
+		if (watcher && !watcher.healthy) watcher.attach();
+		const trusted = watcher !== null && watcher.healthy && !this.sweepNeeded && this.dirty.size <= this.internal.maxDirtyPaths && performance.now() - this.lastFullAt < this.internal.sweepIntervalMs;
+		if (!trusted) {
+			// Events arriving during the discovery stay in the (fresh) dirty set for the next refresh.
+			this.dirty = new Set();
+			this.dirtyDirs = new Set();
+			const startedAt = performance.now();
+			this.fullSweeps++;
+			const files = await this.discover(signal);
+			if (!files) return null;
+			const present = new Set<string>();
+			const changedFiles: DiscoveredFile[] = [];
+			for (const f of files) {
+				present.add(f.path);
+				const r = this.records.get(f.path);
+				if (!r || r.size !== f.size || r.mtimeMs !== f.mtimeMs) changedFiles.push(f);
+			}
+			const removed: string[] = [];
+			for (const p of this.records.keys()) if (!present.has(p)) removed.push(p);
+			if (watcher && watcher.healthy) {
+				this.sweepNeeded = false;
+				this.lastFullAt = startedAt;
+			}
+			return { changedFiles, removed, present };
+		}
+		// Dirty-only: nothing dirty means no filesystem access at all.
+		const dirty = this.dirty;
+		const dirs = this.dirtyDirs;
+		this.dirty = new Set();
+		this.dirtyDirs = new Set();
+		for (const dir of dirs) await this.expandDirectory(dir, dirty);
+		this.dirtyPathsChecked += dirty.size;
+		const changedFiles: DiscoveredFile[] = [];
+		const removed: string[] = [];
+		try {
+			await Promise.all(
+				[...dirty].map(async (path) => {
+					const kind = this.fileKind(path);
+					const known = this.records.get(path);
+					if (!kind && !known) return;
+					try {
+						const st = await lstat(path);
+						if (!st.isFile()) {
+							if (known) removed.push(path);
+							return;
+						}
+						if (!known || known.size !== st.size || known.mtimeMs !== st.mtimeMs) changedFiles.push({ path, kind: known?.kind ?? kind!, size: st.size, mtimeMs: st.mtimeMs });
+					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") {
+							if (known) removed.push(path);
+						} else {
+							throw error;
+						}
+					}
+				})
+			);
+		} catch {
+			this.sweepNeeded = true;
+			return this.findChanges(signal);
+		}
+		return { changedFiles, removed, present: null };
 	}
 
 	/** Bring records, contributions and the ledger up to date with the filesystem. False when aborted. */
@@ -155,21 +320,20 @@ export class UsageIndexCore {
 				return { ok: false, changed: false };
 			}
 		}
-		const files = await this.discover(signal);
-		if (!files) {
+		if (this.live) this.ensureWatcher();
+		let changes: Changes | null;
+		try {
+			changes = await this.findChanges(signal);
+		} catch {
+			changes = null;
+			this.sweepNeeded = true;
+		}
+		if (!changes) {
+			this.sweepNeeded = true;
 			if (firstLoad) this.ledger.apply(this.tracker.update({ upserts: this.recordUpserts(), removed: [] }));
 			return { ok: false, changed: false };
 		}
-
-		const present = new Set<string>();
-		const changedFiles: DiscoveredFile[] = [];
-		for (const f of files) {
-			present.add(f.path);
-			const r = this.records.get(f.path);
-			if (!r || r.size !== f.size || r.mtimeMs !== f.mtimeMs) changedFiles.push(f);
-		}
-		const removed: string[] = [];
-		for (const p of this.records.keys()) if (!present.has(p)) removed.push(p);
+		const { changedFiles, removed, present } = changes;
 
 		const hadRecords = this.records.size > 0;
 		const mode = hadRecords ? "update" : firstLoad && this.legacyExisted ? "rebuild" : "first-run";
@@ -183,7 +347,7 @@ export class UsageIndexCore {
 		const unchanged: ParseOutcome[] = [];
 		if (firstLoad) {
 			const changedPaths = new Set(changedFiles.map((f) => f.path));
-			for (const r of this.records.values()) if (present.has(r.path) && !changedPaths.has(r.path)) unchanged.push({ record: r, change: { type: "full" } });
+			for (const r of this.records.values()) if (present !== null && present.has(r.path) && !changedPaths.has(r.path)) unchanged.push({ record: r, change: { type: "full" } });
 		}
 
 		const upserts: ParseOutcome[] = [];
@@ -230,6 +394,7 @@ export class UsageIndexCore {
 			pool?.close();
 		}
 
+		if (aborted) this.sweepNeeded = true; // unparsed files must be found again
 		// Apply whatever finished (also when aborted) so records, tracker and ledger never disagree.
 		const gone = [...removed];
 		for (const p of vanished) if (this.records.has(p)) gone.push(p);
@@ -291,26 +456,32 @@ export class UsageIndexCore {
 		return this.store.readRollup();
 	}
 
-	/** Watch the source roots; `onChanged` fires after a background refresh changed the data. */
+	/** Subscribers: `onChanged` fires after a background refresh changed the data. The watcher itself (dirty
+	 * tracking) runs for the core's whole life when `watch !== false`; this only adds the background trigger. */
 	startWatching(onChanged: () => void): void {
-		if (this.watcher || this.disposed) return;
-		this.watcher = new UsageWatcher({
-			roots: watchRoots(this.options.sessionsDir, this.sources),
-			onTrigger: async () => {
-				try {
-					const result = await this.refreshDetailed();
-					if (result.ok && result.changed) onChanged();
-				} catch {
-					// A failed background refresh is retried by the next trigger / sweep.
-				}
-			},
+		if (this.disposed) return;
+		this.onChanged = onChanged;
+		const watcher = this.ensureWatcher();
+		watcher?.setTrigger(async () => {
+			try {
+				const result = await this.refreshDetailed();
+				if (result.ok && result.changed) this.onChanged?.();
+			} catch {
+				// A failed background refresh is retried by the next trigger / sweep.
+			}
 		});
-		this.watcher.start();
 	}
 
 	stopWatching(): void {
+		this.onChanged = null;
+		if (this.live) this.watcher?.setTrigger(null);
+		else this.dropWatcher();
+	}
+
+	private dropWatcher(): void {
 		this.watcher?.stop();
 		this.watcher = null;
+		this.sweepNeeded = true;
 	}
 
 	get watching(): boolean {
@@ -318,7 +489,8 @@ export class UsageIndexCore {
 	}
 
 	async dispose(): Promise<void> {
-		this.stopWatching();
+		this.onChanged = null;
+		this.dropWatcher();
 		await this.chain;
 		await this.flush();
 		this.disposed = true;
