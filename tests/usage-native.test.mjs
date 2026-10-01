@@ -203,11 +203,11 @@ test("loading payload shape and memoization helpers", () => {
 	assert.equal(lazy(), lazy());
 });
 
-test("index.ts wires surfaceData onto the loader and dashboard components", () => {
+test("index.ts wires the flow's surface onto the /usage component", () => {
 	// index.ts uses extensionless imports (pi's loader) and pi packages, so node's
 	// test runner cannot import it; assert the wiring statically.
 	const src = readFileSync(new URL("../usage-extension/index.ts", import.meta.url), "utf8");
-	assert.match(src, /withSurfaceData\(loader, loadingState\.get\)/);
-	assert.match(src, /const surfaceData = lazyRollup\(data\);\s+return \{\s+surfaceData,/);
+	assert.match(src, /this\.surfaceData = \(\) => this\.flow\.surface\(\)/);
+	assert.match(src, /createUsageFlow\(/);
 	assert.doesNotMatch(src, /loader\.setMessage\(`/);
 });

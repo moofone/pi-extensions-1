@@ -13,9 +13,10 @@ import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-wor
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Container, Spacer, matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-import { collectUsageData, compareNamedSeries, formatCacheHitPercent, getAgentDir, TAB_ORDER } from "./data";
-import type { CollectProgress } from "./data";
-import { lazyRollup, loadingSurface, withSurfaceData } from "./native";
+import { compareNamedSeries, formatCacheHitPercent, getAgentDir, TAB_ORDER } from "./data";
+import { getUsageIndex } from "./index/client";
+import { createUsageFlow, INITIAL_LOADING_MESSAGE } from "./usage-flow";
+import type { UsageFlow } from "./usage-flow";
 import { parseUsageSourcesSetting } from "./sources";
 import type { ResolvedUsageSources } from "./sources";
 import type { BaseStats, ProviderStats, TabName, TotalStats, UsageData } from "./data";
@@ -246,18 +247,6 @@ const COLOR_RESET = "\x1b[39m";
 
 function seriesColor(index: number): string {
 	return SERIES_COLORS[index % SERIES_COLORS.length]!;
-}
-
-/** "14:32" if the timestamp is today, otherwise "16 Jul" (with year if not this year). */
-function formatSinceDate(ms: number): string {
-	const d = new Date(ms);
-	const now = new Date();
-	if (d.toDateString() === now.toDateString()) {
-		return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-	}
-	const opts: Intl.DateTimeFormatOptions = { day: "numeric", month: "short" };
-	if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
-	return d.toLocaleDateString(undefined, opts);
 }
 
 function padLeft(s: string, len: number): string {
@@ -1150,12 +1139,134 @@ class UsageComponent {
 	invalidate(): void {
 		this.renderCache = null;
 	}
+
+	/**
+	 * Swap in fresher data while open. View, tab, metric, grouping, top-N, cursor, filters, hidden
+	 * series and expanded rows are kept; indices are clamped to the new data; every model derived from
+	 * the old data (memo, input rates, render cache) is dropped.
+	 */
+	setData(data: UsageData): void {
+		this.data = data;
+		this.memoStore.clear();
+		this.inputRates = null;
+		this.renderCache = null;
+		this.updateProviderOrder(); // also clamps selectedIndex
+		const plan = planFor(this.memo, this.data, this.activeTab, this.lastWidth);
+		if (this.bucketCursor !== null) {
+			this.bucketCursor = plan.buckets.length === 0 ? null : Math.min(this.bucketCursor, plan.buckets.length - 1);
+		}
+		this.graphLegendIndex = Math.max(0, this.graphLegendIndex);
+		this.requestRender();
+	}
+
 	dispose(): void {}
 }
 
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
+
+/** One component for the whole /usage session: loader (only if the snapshot is slow) → dashboard. */
+class UsageSession {
+	surfaceData: () => ReturnType<UsageFlow["surface"]>;
+	private loader: CancellableLoader | null = null;
+	private message = INITIAL_LOADING_MESSAGE;
+	private dashboard: { usage: UsageComponent; container: Container; theme: Theme } | null = null;
+	private flow: UsageFlow;
+	private ended = false;
+
+	constructor(
+		private readonly tui: { requestRender(): void; terminal: { rows: number } },
+		private readonly theme: Theme,
+		private readonly done: () => void,
+		sources: ResolvedUsageSources | undefined
+	) {
+		this.flow = createUsageFlow({
+			index: getUsageIndex({ sources }),
+			callbacks: {
+				showLoading: (message) => {
+					this.message = message;
+					if (this.dashboard || this.ended) return;
+					this.loader = new CancellableLoader(
+						tui as never,
+						(s: string) => theme.fg("accent", s),
+						(s: string) => theme.fg("muted", s),
+						message
+					);
+					this.loader.onAbort = () => this.close();
+					tui.requestRender();
+				},
+				setLoadingMessage: (message) => {
+					this.message = message;
+					this.loader?.setMessage(message);
+				},
+				showDashboard: (data) => {
+					this.loader?.dispose();
+					this.loader = null;
+					const container = new Container();
+					container.addChild(new Spacer(1));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
+					container.addChild(new Spacer(1));
+					const usage = new UsageComponent(
+						theme,
+						data,
+						() => tui.requestRender(),
+						() => this.close(),
+						() => tui.terminal.rows || 40
+					);
+					this.dashboard = { usage, container, theme };
+					tui.requestRender();
+				},
+				updateDashboard: (data) => this.dashboard?.usage.setData(data),
+				surfaceChanged: () => tui.requestRender(),
+				end: () => this.finish(),
+			},
+		});
+		this.surfaceData = () => this.flow.surface();
+		void this.flow.start();
+	}
+
+	private finish(): void {
+		if (this.ended) return;
+		this.ended = true;
+		this.loader?.dispose();
+		this.loader = null;
+		this.done();
+	}
+
+	private close(): void {
+		this.flow.close();
+		this.finish();
+	}
+
+	render(w: number): string[] {
+		if (this.dashboard) {
+			const { container, usage, theme } = this.dashboard;
+			const borderLines = clampLines(container.render(w), w);
+			const usageLines = usage.render(w);
+			const bottomBorder = theme.fg("border", "─".repeat(w));
+			return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
+		}
+		return this.loader ? this.loader.render(w) : [];
+	}
+
+	invalidate(): void {
+		this.dashboard?.container.invalidate();
+		this.dashboard?.usage.invalidate();
+		this.loader?.invalidate();
+	}
+
+	handleInput(input: string): void {
+		if (this.dashboard) this.dashboard.usage.handleInput(input);
+		else this.loader?.handleInput(input);
+	}
+
+	dispose(): void {
+		this.flow.close();
+		this.loader?.dispose();
+		this.loader = null;
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("usage", {
@@ -1165,92 +1276,14 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const data = await ctx.ui.custom<UsageData | null>((tui, theme, _kb, done) => {
-				const loader = new CancellableLoader(
-					tui,
-					(s: string) => theme.fg("accent", s),
-					(s: string) => theme.fg("muted", s),
-					"Loading Usage..."
-				);
-				const loadingState = loadingSurface("Loading Usage...");
-				withSurfaceData(loader, loadingState.get);
-				const setLoadingMessage = (message: string): void => {
-					loadingState.set(message);
-					loader.setMessage(message);
-				};
-				let finished = false;
-				const finish = (value: UsageData | null) => {
-					if (finished) return;
-					finished = true;
-					loader.dispose();
-					done(value);
-				};
-
-				loader.onAbort = () => finish(null);
-
-				const onProgress = (p: CollectProgress): void => {
-					if (finished || p.filesToParse === 0) return;
-					const files = `${p.filesParsed.toLocaleString()}/${p.filesToParse.toLocaleString()} files`;
-					if (p.mode === "update") {
-						const since = p.sinceMs !== null ? ` since ${formatSinceDate(p.sinceMs)}` : "";
-						setLoadingMessage(`Updating your usage history${since}… (${files})`);
-					} else if (p.mode === "rebuild") {
-						setLoadingMessage(`Rebuilding your usage history — the cache format changed… (${files})`);
-					} else {
-						setLoadingMessage(`Building your usage history for the first time… (${files})`);
-					}
-				};
-
-				let sources: ResolvedUsageSources | undefined;
-				try {
-					sources = parseUsageSourcesSetting(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
-				} catch {
-					sources = undefined;
-				}
-				collectUsageData({ signal: loader.signal, onProgress, sources })
-					.then(finish)
-					.catch(() => finish(null));
-
-				return loader;
-			});
-
-			if (!data) {
-				return;
+			let sources: ResolvedUsageSources | undefined;
+			try {
+				sources = parseUsageSourcesSetting(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
+			} catch {
+				sources = undefined;
 			}
 
-			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-				const container = new Container();
-
-				// Top border
-				container.addChild(new Spacer(1));
-				container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
-				container.addChild(new Spacer(1));
-
-				const usage = new UsageComponent(
-					theme,
-					data,
-					() => tui.requestRender(),
-					() => done(),
-					() => tui.terminal.rows || 40
-				);
-
-				const surfaceData = lazyRollup(data);
-				return {
-					surfaceData,
-					render: (w: number) => {
-						const borderLines = clampLines(container.render(w), w);
-						const usageLines = usage.render(w);
-						const bottomBorder = theme.fg("border", "─".repeat(w));
-						return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
-					},
-					invalidate: () => {
-						container.invalidate();
-						usage.invalidate();
-					},
-					handleInput: (input: string) => usage.handleInput(input),
-					dispose: () => {},
-				};
-			});
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => new UsageSession(tui, theme, () => done(), sources));
 		},
 	});
 }

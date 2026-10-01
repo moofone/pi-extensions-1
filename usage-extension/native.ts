@@ -70,18 +70,27 @@ export interface UsageNativeRollupPayload {
 	kind: typeof USAGE_NATIVE_KIND;
 	v: typeof USAGE_NATIVE_VERSION;
 	rollup: UsageRollup;
+	/** Present while a refresh is in flight and `rollup` is the previous (cached) one. */
+	loading?: { message: string };
 }
 
 export interface UsageNativeLoadingPayload {
 	kind: typeof USAGE_NATIVE_KIND;
 	v: typeof USAGE_NATIVE_VERSION;
 	loading: { message: string };
+	/** Cached rollup to show while loading ("refreshing" state). */
+	rollup?: UsageRollup;
 }
 
 export type UsageNativePayload = UsageNativeRollupPayload | UsageNativeLoadingPayload;
 
 export function usageLoadingPayload(message: string): UsageNativeLoadingPayload {
 	return { kind: USAGE_NATIVE_KIND, v: USAGE_NATIVE_VERSION, loading: { message } };
+}
+
+/** Cached rollup + "refreshing" state (instant first paint). */
+export function usageRefreshingPayload(rollup: UsageRollup, message: string): UsageNativeRollupPayload & { loading: { message: string } } {
+	return { kind: USAGE_NATIVE_KIND, v: USAGE_NATIVE_VERSION, rollup, loading: { message } };
 }
 
 function pad2(n: number): string {
