@@ -26,6 +26,7 @@ import {
 	parseUsageFileBuffer,
 	pricedDevinCost,
 	splitCost,
+	unterminatedTailComplete,
 } from "./sources.ts";
 import type { ExtraSourceKind, ResolvedUsageSources, UsageFileKind } from "./sources.ts";
 import { compareCanonical } from "./index/types.ts";
@@ -719,34 +720,62 @@ function lineMightBeRelevant(line: Buffer): boolean {
 	);
 }
 
+/** Result of parsing one chunk of a JSONL file (complete lines only when `completeOnly`). */
+export interface ChunkParseResult {
+	messages: SessionMessage[];
+	toolUsages: ToolUsageRecord[];
+	/** Bytes of the chunk consumed: through the last "\n" when `completeOnly`, else the whole chunk. */
+	consumed: number;
+	/** Parser state after the consumed bytes (JSON-serialisable); feed it to the next chunk. */
+	state: Record<string, unknown>;
+	/** True when this chunk changes the meaning of records parsed earlier (so the caller must parse from 0). */
+	reparse: boolean;
+}
+
 /**
- * Extract the session id plus assistant/tool/summary usage from a JSONL buffer.
- * Returns partial results when aborted — callers must check `signal.aborted`
- * before caching or using the result.
+ * Resumable pi parser: parse `buffer` (a file's bytes starting where `state` was captured; null → file start).
+ * Chunked parsing with state carried across chunks equals one full parse.
  */
-export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
+export async function parseSessionChunk(
+	buffer: Buffer,
+	state: Record<string, unknown> | null,
+	completeOnly: boolean,
+	signal?: AbortSignal
+): Promise<ChunkParseResult> {
 	const messages: SessionMessage[] = [];
 	const toolUsages: ToolUsageRecord[] = [];
-	let sessionId = "";
-	let cwd = "";
+	let sessionId: unknown = state?.sessionId ?? "";
+	let cwd = typeof state?.cwd === "string" ? state.cwd : "";
 	// Assistant messages don't carry the thinking level; pi records it as separate
 	// thinking_level_change entries, always written before the first assistant
 	// message of a session. Replaying them in append order attributes each message
 	// to the level active when it was produced.
-	let thinkingLevel = "";
-	let compactionPending = false;
+	let thinkingLevel = typeof state?.thinkingLevel === "string" ? state.thinkingLevel : "";
+	let compactionPending = state?.compactionPending === true;
 
 	let start = 0;
+	let consumed = 0;
 	let lineNumber = 0;
+
+	const result = (): ChunkParseResult => ({
+		messages,
+		toolUsages,
+		consumed,
+		state: { sessionId, cwd, thinkingLevel, compactionPending },
+		reparse: false,
+	});
 
 	while (start < buffer.length) {
 		let end = buffer.indexOf(NEWLINE, start);
-		if (end === -1) end = buffer.length;
+		if (end === -1) {
+			if (completeOnly && !unterminatedTailComplete(buffer, start)) break;
+			end = buffer.length;
+		}
 
 		lineNumber++;
 		if (lineNumber % PARSE_YIELD_EVERY_LINES === 0) {
 			await new Promise<void>((resolve) => setImmediate(resolve));
-			if (signal?.aborted) return { sessionId, cwd, messages, toolUsages };
+			if (signal?.aborted) return result();
 		}
 
 		const lineBuffer = buffer.subarray(start, end);
@@ -756,6 +785,7 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 				const toolUsage = parseLargeToolResultLine(lineBuffer);
 				if (toolUsage) toolUsages.push(toolUsage);
 				start = end + 1;
+				consumed = Math.min(start, buffer.length);
 				continue;
 			}
 			try {
@@ -811,9 +841,20 @@ export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): 
 		}
 
 		start = end + 1;
+		consumed = Math.min(start, buffer.length);
 	}
 
-	return { sessionId, cwd, messages, toolUsages };
+	return result();
+}
+
+/**
+ * Extract the session id plus assistant/tool/summary usage from a JSONL buffer.
+ * Returns partial results when aborted — callers must check `signal.aborted`
+ * before caching or using the result.
+ */
+export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
+	const chunk = await parseSessionChunk(buffer, null, false, signal);
+	return { sessionId: chunk.state.sessionId as string, cwd: chunk.state.cwd as string, messages: chunk.messages, toolUsages: chunk.toolUsages };
 }
 
 // =============================================================================

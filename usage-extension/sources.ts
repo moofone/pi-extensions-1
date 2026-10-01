@@ -25,7 +25,7 @@ import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import type { ParsedSessionFile, SessionMessage, UsageAmount } from "./data.ts";
+import type { ChunkParseResult, ParsedSessionFile, SessionMessage, UsageAmount } from "./data.ts";
 
 export type ExtraSourceKind = "claude-code" | "codex-cli" | "grok-build" | "opencode-go";
 export type UsageFileKind = "pi" | ExtraSourceKind;
@@ -502,21 +502,41 @@ function lineHas(line: Buffer, ...needles: Buffer[]): boolean {
 	return false;
 }
 
+/** True when the unterminated bytes from `start` are already a complete JSON object (writer finished the
+ * record but not the newline yet). A mid-write object can never parse, so this never consumes a partial line. */
+export function unterminatedTailComplete(buffer: Buffer, start: number): boolean {
+	let last = buffer.length - 1;
+	while (last >= start && (buffer[last] === 0x20 || buffer[last] === 0x09 || buffer[last] === 0x0d)) last--;
+	if (last < start || buffer[last] !== 0x7d) return false;
+	try {
+		JSON.parse(buffer.toString("utf8", start, buffer.length));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Returns the bytes consumed: everything, or (completeOnly) through the last "\n". */
 async function forEachJsonLine(
 	buffer: Buffer,
 	relevant: (line: Buffer) => boolean,
 	onEntry: (entry: Record<string, unknown>) => void,
 	signal?: AbortSignal,
-): Promise<void> {
+	completeOnly = false,
+): Promise<number> {
 	let start = 0;
+	let consumed = 0;
 	let lineNumber = 0;
 	while (start < buffer.length) {
 		let end = buffer.indexOf(NEWLINE, start);
-		if (end === -1) end = buffer.length;
+		if (end === -1) {
+			if (completeOnly && !unterminatedTailComplete(buffer, start)) break;
+			end = buffer.length;
+		}
 		lineNumber++;
 		if (lineNumber % PARSE_YIELD_EVERY_LINES === 0) {
 			await new Promise<void>((resolve) => setImmediate(resolve));
-			if (signal?.aborted) return;
+			if (signal?.aborted) return consumed;
 		}
 		if (end > start) {
 			const line = buffer.subarray(start, end);
@@ -531,15 +551,28 @@ async function forEachJsonLine(
 			}
 		}
 		start = end + 1;
+		consumed = Math.min(start, buffer.length);
 	}
+	return consumed;
 }
 
-export async function parseClaudeCodeBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
-	const messages: SessionMessage[] = [];
-	let sessionId = "";
-	let cwd = "";
+type ParserState = Record<string, unknown> | null;
 
-	await forEachJsonLine(
+function stateString(state: ParserState, key: string): string {
+	const value = state?.[key];
+	return typeof value === "string" ? value : "";
+}
+
+function chunkToParsed(chunk: ChunkParseResult): ParsedSessionFile {
+	return { sessionId: chunk.state.sessionId as string, cwd: chunk.state.cwd as string, messages: chunk.messages, toolUsages: chunk.toolUsages };
+}
+
+export async function parseClaudeCodeChunk(buffer: Buffer, state: ParserState, completeOnly: boolean, signal?: AbortSignal): Promise<ChunkParseResult> {
+	const messages: SessionMessage[] = [];
+	let sessionId = stateString(state, "sessionId");
+	let cwd = stateString(state, "cwd");
+
+	const consumed = await forEachJsonLine(
 		buffer,
 		(line) => lineHas(line, PATTERN_CC_ASSISTANT_COMPACT, PATTERN_CC_ASSISTANT_SPACED),
 		(entry) => {
@@ -567,19 +600,49 @@ export async function parseClaudeCodeBuffer(buffer: Buffer, signal?: AbortSignal
 			);
 		},
 		signal,
+		completeOnly,
 	);
 
-	return { sessionId, cwd, messages, toolUsages: [] };
+	return { messages, toolUsages: [], consumed, state: { sessionId, cwd }, reparse: false };
 }
 
-export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
-	let sessionId = "";
-	let cwd = "";
-	const contexts = new Map<string, { model: string; effort: string }>();
-	let lastContext = { model: "unknown", effort: "" };
+export async function parseClaudeCodeBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
+	return chunkToParsed(await parseClaudeCodeChunk(buffer, null, false, signal));
+}
+
+interface CodexContext {
+	model: string;
+	effort: string;
+}
+
+/**
+ * Codex attributes each usage record to its turn context as of the END of the file (a later turn_context can
+ * re-define an earlier turn, and records without a known turn use the last context). A chunk therefore sets
+ * `reparse` when it adds/changes a context that earlier records may have resolved against.
+ * State: sessionId, cwd, contexts (turn id -> model/effort, as [id, model, effort] rows), lastContext,
+ * fallbackUsed (an earlier record used lastContext).
+ */
+export async function parseCodexCliChunk(buffer: Buffer, state: ParserState, completeOnly: boolean, signal?: AbortSignal): Promise<ChunkParseResult> {
+	let sessionId = stateString(state, "sessionId");
+	let cwd = stateString(state, "cwd");
+	const contexts = new Map<string, CodexContext>();
+	const rows = state?.contexts;
+	if (Array.isArray(rows)) {
+		for (const row of rows as unknown[]) {
+			if (Array.isArray(row)) contexts.set(String(row[0]), { model: String(row[1]), effort: String(row[2]) });
+		}
+	}
+	const lastRaw = asRecord(state?.lastContext);
+	let lastContext: CodexContext = lastRaw
+		? { model: String(lastRaw.model), effort: String(lastRaw.effort) }
+		: { model: "unknown", effort: "" };
+	const priorFallbackUsed = state?.fallbackUsed === true;
+	let fallbackUsed = priorFallbackUsed;
+	let reparse = false;
+	let sawContext = false;
 	const records: Array<{ turnId: string; sourceId: string; timestamp: number; usage: Record<string, unknown> }> = [];
 
-	await forEachJsonLine(
+	const consumed = await forEachJsonLine(
 		buffer,
 		(line) =>
 			lineHas(
@@ -604,7 +667,12 @@ export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal):
 				const model = typeof payload.model === "string" && payload.model ? payload.model : "unknown";
 				const effort = typeof payload.effort === "string" ? payload.effort : "";
 				const ctx = { model, effort };
-				if (turnId) contexts.set(turnId, ctx);
+				sawContext = true;
+				if (turnId) {
+					const known = contexts.get(turnId);
+					if (known && (known.model !== model || known.effort !== effort)) reparse = true;
+					contexts.set(turnId, ctx);
+				}
 				lastContext = ctx;
 				if (typeof payload.cwd === "string" && !cwd) cwd = payload.cwd;
 				return;
@@ -620,13 +688,17 @@ export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal):
 			});
 		},
 		signal,
+		completeOnly,
 	);
+	if (priorFallbackUsed && sawContext) reparse = true;
 
 	const messages: SessionMessage[] = [];
 	for (const record of records) {
 		const amount = codexCliTokenAmount(record.usage);
 		if (!amount) continue;
-		const ctx = (record.turnId && contexts.get(record.turnId)) || lastContext;
+		const known = record.turnId ? contexts.get(record.turnId) : undefined;
+		if (!known) fallbackUsed = true;
+		const ctx = known || lastContext;
 		messages.push(
 			assistantMessage({
 				provider: "openai-codex",
@@ -639,15 +711,31 @@ export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal):
 		);
 	}
 
-	return { sessionId, cwd, messages, toolUsages: [] };
+	return {
+		messages,
+		toolUsages: [],
+		consumed,
+		state: {
+			sessionId,
+			cwd,
+			contexts: [...contexts].map(([id, ctx]) => [id, ctx.model, ctx.effort]),
+			lastContext,
+			fallbackUsed,
+		},
+		reparse,
+	};
 }
 
-export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
-	const messages: SessionMessage[] = [];
-	let sessionId = "";
-	let cwd = "";
+export async function parseCodexCliBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
+	return chunkToParsed(await parseCodexCliChunk(buffer, null, false, signal));
+}
 
-	await forEachJsonLine(
+export async function parseGrokBuildChunk(buffer: Buffer, state: ParserState, completeOnly: boolean, signal?: AbortSignal): Promise<ChunkParseResult> {
+	const messages: SessionMessage[] = [];
+	let sessionId = stateString(state, "sessionId");
+	const cwd = stateString(state, "cwd");
+
+	const consumed = await forEachJsonLine(
 		buffer,
 		(line) => lineHas(line, PATTERN_GROK_TURN),
 		(entry) => {
@@ -686,9 +774,14 @@ export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal)
 			}
 		},
 		signal,
+		completeOnly,
 	);
 
-	return { sessionId, cwd, messages, toolUsages: [] };
+	return { messages, toolUsages: [], consumed, state: { sessionId, cwd }, reparse: false };
+}
+
+export async function parseGrokBuildBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
+	return chunkToParsed(await parseGrokBuildChunk(buffer, null, false, signal));
 }
 
 export function canonicalProvider(provider: string): string {
@@ -780,6 +873,29 @@ export async function parseUsageFileBuffer(
 		case "pi":
 			if (!parsePi) throw new Error("parseUsageFileBuffer(pi) requires parsePi");
 			return parsePi(buffer, signal);
+	}
+}
+
+/** Resumable chunk parse for the JSONL kinds (opencode-go message files are single documents: not chunkable). */
+export async function parseUsageFileChunk(
+	kind: UsageFileKind,
+	buffer: Buffer,
+	state: ParserState,
+	completeOnly: boolean,
+	signal: AbortSignal | undefined,
+	parsePi: (buffer: Buffer, state: ParserState, completeOnly: boolean, signal?: AbortSignal) => Promise<ChunkParseResult>,
+): Promise<ChunkParseResult> {
+	switch (kind) {
+		case "claude-code":
+			return parseClaudeCodeChunk(buffer, state, completeOnly, signal);
+		case "codex-cli":
+			return parseCodexCliChunk(buffer, state, completeOnly, signal);
+		case "grok-build":
+			return parseGrokBuildChunk(buffer, state, completeOnly, signal);
+		case "pi":
+			return parsePi(buffer, state, completeOnly, signal);
+		case "opencode-go":
+			throw new Error("opencode-go files are not chunk-parseable");
 	}
 }
 
