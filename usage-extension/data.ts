@@ -28,6 +28,7 @@ import {
 	splitCost,
 } from "./sources.ts";
 import type { ExtraSourceKind, ResolvedUsageSources, UsageFileKind } from "./sources.ts";
+import { compareCanonical } from "./index/types.ts";
 
 // =============================================================================
 // Types
@@ -90,12 +91,12 @@ export interface PeriodInsights {
 	insights: Insight[];
 }
 
-interface CostCount {
+export interface CostCount {
 	cost: number;
 	messages: number;
 }
 
-interface PeriodRawData {
+export interface PeriodRawData {
 	/** All recorded cost, including usage reported by tools and summaries. */
 	totalCost: number;
 	/** Cost attached to assistant messages, used as the turn-insight denominator. */
@@ -123,7 +124,7 @@ interface PeriodRawData {
 }
 
 /** Per-message adjacency info, computed on raw file order before dedupe. */
-interface MessageMeta {
+export interface MessageMeta {
 	/** Gap to the previous assistant message in the same file; -1 when unknown. */
 	gapMs: number;
 	/** Context size of the previous assistant message in the same file; 0 when first. */
@@ -416,7 +417,7 @@ function parsedTimestamp(messageTimestamp: unknown, entryTimestamp: unknown): nu
 	return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function auxiliaryMessage(usage: UsageAmount, timestamp: number, sourceId: string): SessionMessage {
+export function auxiliaryMessage(usage: UsageAmount, timestamp: number, sourceId: string): SessionMessage {
 	return {
 		provider: AUXILIARY_PROVIDER,
 		model: AUXILIARY_MODEL,
@@ -1097,19 +1098,19 @@ export async function saveUsageCache(cachePath: string, states: Map<string, Cach
 // Aggregation
 // =============================================================================
 
-function emptyTokens(): TokenStats {
+export function emptyTokens(): TokenStats {
 	return { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 }
 
-function emptyModelStats(): ModelStats {
+export function emptyModelStats(): ModelStats {
 	return { sessions: new Set(), messages: 0, cost: 0, estCost: 0, tokens: emptyTokens() };
 }
 
-function emptyProviderStats(): ProviderStats {
+export function emptyProviderStats(): ProviderStats {
 	return { sessions: new Set(), messages: 0, cost: 0, estCost: 0, tokens: emptyTokens(), models: new Map() };
 }
 
-function emptyTimeFilteredStats(): TimeFilteredStats {
+export function emptyTimeFilteredStats(): TimeFilteredStats {
 	return {
 		providers: new Map(),
 		totals: { sessions: 0, messages: 0, cost: 0, estCost: 0, tokens: emptyTokens() },
@@ -1117,7 +1118,7 @@ function emptyTimeFilteredStats(): TimeFilteredStats {
 	};
 }
 
-function emptyPeriodRawData(): PeriodRawData {
+export function emptyPeriodRawData(): PeriodRawData {
 	return {
 		totalCost: 0,
 		assistantCost: 0,
@@ -1163,7 +1164,7 @@ export function projectLabelFromCwd(cwd: string): string {
 	return homePrefix !== null ? `~/${label}` : `/${label}`;
 }
 
-function emptyUsageData(bounds: PeriodBounds): UsageData {
+export function emptyUsageData(bounds: PeriodBounds): UsageData {
 	return {
 		today: emptyTimeFilteredStats(),
 		thisWeek: emptyTimeFilteredStats(),
@@ -1175,9 +1176,9 @@ function emptyUsageData(bounds: PeriodBounds): UsageData {
 	};
 }
 
-const HOUR_MS = 3_600_000;
+export const HOUR_MS = 3_600_000;
 
-function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg: SessionMessage, miss: MissKind | null): void {
+export function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg: SessionMessage, miss: MissKind | null): void {
 	if (msg.timestamp <= 0) return; // Unknown time can't be placed on a time axis.
 	const hour = Math.floor(msg.timestamp / HOUR_MS) * HOUR_MS;
 	let bucket = hourly.get(hour);
@@ -1229,7 +1230,7 @@ function addToHourlyBuckets(hourly: Map<number, Map<HourlyKey, HourlyCell>>, msg
  * context but this one read (almost) nothing from cache. Compaction changes
  * the prefix legitimately, so post-compaction turns never count.
  */
-function classifyMiss(msg: SessionMessage, mm: MessageMeta, cacheReporting: ReadonlySet<string>): MissKind | null {
+export function classifyMiss(msg: SessionMessage, mm: MessageMeta, cacheReporting: ReadonlySet<string>): MissKind | null {
 	if (msg.source !== "assistant" || msg.afterCompaction) return null;
 	// Providers that never report cache tokens (e.g. Cursor) would read as a
 	// miss on every large turn; with no cache data there is nothing to classify.
@@ -1244,7 +1245,7 @@ function classifyMiss(msg: SessionMessage, mm: MessageMeta, cacheReporting: Read
 }
 
 // Helper to accumulate stats into a target
-function accumulateStats(
+export function accumulateStats(
 	target: BaseStats,
 	cost: number,
 	tokens: { total: number; input: number; output: number; cacheRead: number; cacheWrite: number },
@@ -1261,7 +1262,7 @@ function accumulateStats(
 	target.tokens.cacheWrite += tokens.cacheWrite;
 }
 
-function getPeriodsForTimestamp(
+export function getPeriodsForTimestamp(
 	timestamp: number,
 	todayMs: number,
 	weekStartMs: number,
@@ -1279,10 +1280,10 @@ function getPeriodsForTimestamp(
 	return periods;
 }
 
-const DAY_MS = 24 * HOUR_MS;
+export const DAY_MS = 24 * HOUR_MS;
 const PROGRESS_REPORT_EVERY = 100;
 
-function addMessagesToUsageData(
+export function addMessagesToUsageData(
 	data: UsageData,
 	sessionId: string,
 	project: string,
@@ -1411,14 +1412,14 @@ function addMessagesToUsageData(
 // identities are therefore unioned across all copies of an entry before any
 // emission, and identical emissions collapse in the sourceId dedupe.
 
-interface ScannedSessionIndex {
+export interface ScannedSessionIndex {
 	/** Resolved paths of scanned files that have a session header. */
 	paths: Set<string>;
 	/** Directory of each scanned file → number of scanned files inside it. */
 	fileCountByDir: Map<string, number>;
 }
 
-function buildScannedSessionIndex(states: Map<string, CachedFileState>): ScannedSessionIndex {
+export function buildScannedSessionIndex(states: Map<string, CachedFileState>): ScannedSessionIndex {
 	const paths = new Set<string>();
 	const fileCountByDir = new Map<string, number>();
 	for (const [filePath, state] of states) {
@@ -1431,7 +1432,7 @@ function buildScannedSessionIndex(states: Map<string, CachedFileState>): Scanned
 	return { paths, fileCountByDir };
 }
 
-function childSessionScanned(
+export function childSessionScanned(
 	parentFilePath: string,
 	tool: ToolUsageRecord,
 	child: ChildToolUsage,
@@ -1454,12 +1455,12 @@ function childSessionScanned(
 }
 
 /** Identity of one child slot of one tool entry, stable across copied history. */
-function toolChildIdentity(tool: ToolUsageRecord, child: ChildToolUsage): string {
+export function toolChildIdentity(tool: ToolUsageRecord, child: ChildToolUsage): string {
 	const fingerprint = child.usage.input + child.usage.output + child.usage.cacheRead + child.usage.cacheWrite;
 	return `${tool.sourceId}:${tool.timestamp}:${child.resultIndex}:${fingerprint}`;
 }
 
-function resolvedToolChildIdentities(states: Map<string, CachedFileState>, index: ScannedSessionIndex): Set<string> {
+export function resolvedToolChildIdentities(states: Map<string, CachedFileState>, index: ScannedSessionIndex): Set<string> {
 	const resolved = new Set<string>();
 	for (const [filePath, state] of states) {
 		for (const tool of state.parsed.toolUsages) {
@@ -1472,7 +1473,7 @@ function resolvedToolChildIdentities(states: Map<string, CachedFileState>, index
 	return resolved;
 }
 
-function toolUsageMessages(
+export function toolUsageMessages(
 	parentFilePath: string,
 	tool: ToolUsageRecord,
 	index: ScannedSessionIndex,
@@ -1525,7 +1526,20 @@ export interface CollectUsageOptions {
 	sources?: ResolvedUsageSources;
 }
 
+/**
+ * Public entry point. The service lane (usage index) repoints this at the incremental index; until then it
+ * is the legacy full pass.
+ */
 export async function collectUsageData(options: CollectUsageOptions = {}): Promise<UsageData | null> {
+	return collectUsageDataLegacy(options);
+}
+
+/**
+ * The original full-pass collector, kept as the equivalence oracle for the usage index
+ * (index/ledger snapshot must deep-equal this for the same files and `now`). Files are aggregated in
+ * canonical order (index/types.ts `compareCanonical`).
+ */
+export async function collectUsageDataLegacy(options: CollectUsageOptions = {}): Promise<UsageData | null> {
 	const signal = options.signal;
 	const now = options.now ?? new Date();
 	const sessionsDir = options.sessionsDir ?? getSessionsDir();
@@ -1587,6 +1601,9 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 			if (signal?.aborted) return null;
 		}
 	}
+
+	// Canonical order (kind rank, then path) so dedupe ownership and session starts are deterministic.
+	filePaths.sort((a, b) => compareCanonical({ kind: fileKinds.get(a)!, path: a }, { kind: fileKinds.get(b)!, path: b }));
 
 	// 2. Stat them (batched) so cache freshness can be checked without reading contents.
 	const fileStats = new Map<string, { size: number; mtimeMs: number }>();
@@ -1818,8 +1835,8 @@ export async function collectUsageData(options: CollectUsageOptions = {}): Promi
 // =============================================================================
 
 // Context tax (structure)
-const CTX_TAX_THRESHOLD = 150_000;
-const CTX_LOW_THRESHOLD = 100_000;
+export const CTX_TAX_THRESHOLD = 150_000;
+export const CTX_LOW_THRESHOLD = 100_000;
 // Project mix (structure)
 const PROJECT_TOP_COUNT = 3;
 const PROJECT_MAX_DOMINANCE_PERCENT = 90;
@@ -1829,15 +1846,15 @@ const REASONING_MIN_PERCENT = 5;
 const TREND_HIGH_RATIO = 1.5;
 const TREND_LOW_RATIO = 0.6;
 // Cache-miss alarms
-const TTL_GAP_MS = 5 * 60_000;
-const MISS_MIN_PREV_CONTEXT = 20_000;
-const MISS_MAX_CACHE_READ = 5_000;
+export const TTL_GAP_MS = 5 * 60_000;
+export const MISS_MIN_PREV_CONTEXT = 20_000;
+export const MISS_MAX_CACHE_READ = 5_000;
 /** pi's built-in test providers never send anything to a real API. The ids pi
  * actually records are `faux` (the default id in providers/faux.ts) and
  * `fake-provider` (used by the RPC prompt tests); `faux-provider` appears only
  * as a fixture label in pi's own test suite. Keep all three so no spelling of a
  * test provider can reach the table, graphs, totals, or insights. */
-const EXCLUDED_PROVIDERS = new Set(["faux", "faux-provider", "fake-provider"]);
+export const EXCLUDED_PROVIDERS = new Set(["faux", "faux-provider", "fake-provider"]);
 
 const CACHE_MISS_ALARM_PERCENT = 2;
 const CACHE_MISS_ALARM_MIN_COST = 1;
@@ -1868,7 +1885,7 @@ function fmtPercent(p: number): string {
  * Periods with zero recorded cost produce an empty list — the UI renders a
  * distinct empty-state for that case.
  */
-function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodInsights {
+export function computeInsights(raw: PeriodRawData, trend: TrendInfo | null): PeriodInsights {
 	if (raw.totalCost <= 0) {
 		return { insights: [] };
 	}
