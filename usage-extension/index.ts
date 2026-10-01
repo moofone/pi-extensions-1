@@ -15,6 +15,7 @@ import { CancellableLoader, Container, Spacer, matchesKey, visibleWidth, truncat
 
 import { collectUsageData, compareNamedSeries, formatCacheHitPercent, getAgentDir, TAB_ORDER } from "./data";
 import type { CollectProgress } from "./data";
+import { lazyRollup, loadingSurface, withSurfaceData } from "./native";
 import { parseUsageSourcesSetting } from "./sources";
 import type { ResolvedUsageSources } from "./sources";
 import type { BaseStats, ProviderStats, TabName, TotalStats, UsageData } from "./data";
@@ -1171,6 +1172,12 @@ export default function (pi: ExtensionAPI) {
 					(s: string) => theme.fg("muted", s),
 					"Loading Usage..."
 				);
+				const loadingState = loadingSurface("Loading Usage...");
+				withSurfaceData(loader, loadingState.get);
+				const setLoadingMessage = (message: string): void => {
+					loadingState.set(message);
+					loader.setMessage(message);
+				};
 				let finished = false;
 				const finish = (value: UsageData | null) => {
 					if (finished) return;
@@ -1186,11 +1193,11 @@ export default function (pi: ExtensionAPI) {
 					const files = `${p.filesParsed.toLocaleString()}/${p.filesToParse.toLocaleString()} files`;
 					if (p.mode === "update") {
 						const since = p.sinceMs !== null ? ` since ${formatSinceDate(p.sinceMs)}` : "";
-						loader.setMessage(`Updating your usage history${since}… (${files})`);
+						setLoadingMessage(`Updating your usage history${since}… (${files})`);
 					} else if (p.mode === "rebuild") {
-						loader.setMessage(`Rebuilding your usage history — the cache format changed… (${files})`);
+						setLoadingMessage(`Rebuilding your usage history — the cache format changed… (${files})`);
 					} else {
-						loader.setMessage(`Building your usage history for the first time… (${files})`);
+						setLoadingMessage(`Building your usage history for the first time… (${files})`);
 					}
 				};
 
@@ -1227,7 +1234,9 @@ export default function (pi: ExtensionAPI) {
 					() => tui.terminal.rows || 40
 				);
 
+				const surfaceData = lazyRollup(data);
 				return {
+					surfaceData,
 					render: (w: number) => {
 						const borderLines = clampLines(container.render(w), w);
 						const usageLines = usage.render(w);

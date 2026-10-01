@@ -277,3 +277,7 @@ The first open after enabling a source parses those files once, then the same si
 ## Changelog
 
 See `CHANGELOG.md`.
+
+## Native clients (pi-hud)
+
+Both `ctx.ui.custom()` components used by `/usage` carry a `surfaceData()` function returning a JSON payload for native hosts (the TUI ignores it): `{ kind: "pi-hud/usage", v: 1, loading: { message } }` while loading, then `{ kind, v, rollup }` where `rollup` is a sparse daily × (provider, model) table (`days`, `keys`, `reporting`, `fields`, `rows`). Built by `buildUsageRollup` in `native.ts`; the same object reference is returned until the content changes.
