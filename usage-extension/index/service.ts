@@ -181,6 +181,9 @@ export class UsageIndexCore {
 		return run;
 	}
 
+	/** A discovery started early (overlapping the first store load); consumed by the next full discovery. */
+	private earlyDiscovery: Promise<DiscoveredFile[] | null> | null = null;
+
 	private discover(signal?: AbortSignal): Promise<DiscoveredFile[] | null> {
 		const options = { sessionsDir: this.options.sessionsDir, sources: this.sources, signal };
 		return this.discoverer ? this.discoverer.discover(options) : discoverModule.discoverFiles(options);
@@ -245,12 +248,17 @@ export class UsageIndexCore {
 		if (watcher && !watcher.healthy) watcher.attach();
 		const trusted = watcher !== null && watcher.healthy && !this.sweepNeeded && this.dirty.size <= this.internal.maxDirtyPaths && performance.now() - this.lastFullAt < this.internal.sweepIntervalMs;
 		if (!trusted) {
-			// Events arriving during the discovery stay in the (fresh) dirty set for the next refresh.
-			this.dirty = new Set();
-			this.dirtyDirs = new Set();
+			const early = this.earlyDiscovery;
+			this.earlyDiscovery = null;
+			// Events arriving during the discovery stay in the (fresh) dirty set for the next refresh. An early
+			// discovery already ran while events were being recorded: keep those, they may postdate its walk.
+			if (!early) {
+				this.dirty = new Set();
+				this.dirtyDirs = new Set();
+			}
 			const startedAt = performance.now();
 			this.fullSweeps++;
-			const files = await this.discover(signal);
+			const files = await (early ?? this.discover(signal));
 			if (!files) return null;
 			const present = new Set<string>();
 			const changedFiles: DiscoveredFile[] = [];
@@ -330,7 +338,13 @@ export class UsageIndexCore {
 		const firstLoad = !this.loaded;
 		if (firstLoad) {
 			if (this.legacyCachePath) this.legacyExisted = await stat(this.legacyCachePath).then(() => true, () => false);
+			// Discovery is I/O-bound and independent of the store: run it while the shards load. Starting the
+			// watcher first keeps every event after this point (the discovery is the baseline it covers).
+			if (this.live) this.ensureWatcher();
+			this.earlyDiscovery = this.discover(signal);
+			this.earlyDiscovery.catch(() => {});
 			this.records = await this.store.load();
+			if (signal?.aborted) this.earlyDiscovery = null;
 			this.loaded = true;
 			if (signal?.aborted) {
 				// Keep the loaded records consistent with the (still empty) ledger on the next pass.
