@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { collectUsageData, emptyHourlyCell, loadUsageCache, makeHourlyKey } from "../usage-extension/data.ts";
+import { collectUsageData, collectUsageDataLegacy, emptyHourlyCell, loadUsageCache, makeHourlyKey } from "../usage-extension/data.ts";
 import { splitCost } from "../usage-extension/sources.ts";
 import {
 	PAINT_MARK,
@@ -288,7 +288,8 @@ test("collectUsageData captures the per-class cost split, 1h writes, and cache-m
 	assert.equal(cursor.missPrefix + cursor.missTtl + cursor.missSwitch, 0, "non-reporting provider never counts misses");
 	assert.equal(cursor.costUnsplit, 0.4, "no breakdown and no catalog rate → unattributed");
 
-	// Round-trip through the v7 cache keeps the split.
+	// Round-trip through the legacy v7 cache keeps the split (the index store has its own format).
+	await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	const reloaded = await loadUsageCache(cachePath);
 	const msgs = reloaded.get(join(sessionsDir, "a.jsonl")).parsed.messages;
 	assert.equal(msgs[0].costCacheWrite, 0.04);

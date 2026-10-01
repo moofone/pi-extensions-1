@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { homedir } from "node:os";
 
-import { cacheHitPercent, collectUsageData, formatCacheHitPercent, loadUsageCache, parseSessionBuffer, projectLabelFromCwd, saveUsageCache } from "../usage-extension/data.ts";
+import { cacheHitPercent, collectUsageData, collectUsageDataLegacy, formatCacheHitPercent, loadUsageCache, parseSessionBuffer, projectLabelFromCwd, saveUsageCache } from "../usage-extension/data.ts";
 
 test("cacheHitPercent counts reads, not writes, against all prompt input", () => {
 	assert.equal(cacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 800 }), 80);
@@ -718,7 +718,7 @@ test("collectUsageData returns null when aborted", async (t) => {
 // collectUsageData — caching
 // =============================================================================
 
-test("collectUsageData reuses the cache for unchanged files and invalidates on change", async (t) => {
+test("collectUsageDataLegacy reuses the cache for unchanged files and invalidates on change", async (t) => {
 	const { sessionsDir, cachePath } = fixture(t);
 	const filePath = join(sessionsDir, "a.jsonl");
 	writeFileSync(
@@ -726,7 +726,7 @@ test("collectUsageData reuses the cache for unchanged files and invalidates on c
 		[sessionLine("s1", TS_TODAY), assistantLine({ ts: TS_TODAY, cost: 1 })].join("\n") + "\n"
 	);
 
-	const first = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const first = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(first.allTime.totals.cost, 1);
 	assert.ok(existsSync(cachePath));
 
@@ -736,12 +736,12 @@ test("collectUsageData reuses the cache for unchanged files and invalidates on c
 	cacheJson.files[filePath].messages[0][2] = 999;
 	writeFileSync(cachePath, JSON.stringify(cacheJson));
 
-	const second = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const second = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(second.allTime.totals.cost, 999, "unchanged file should be served from cache");
 
 	// Appending to the file changes its size → cache entry invalidated → reparse.
 	appendFileSync(filePath, assistantLine({ ts: TS_TODAY + 60_000, cost: 2 }) + "\n");
-	const third = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const third = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(third.allTime.totals.cost, 3, "changed file should be reparsed from disk");
 	assert.equal(third.allTime.totals.messages, 2);
 
@@ -750,7 +750,7 @@ test("collectUsageData reuses the cache for unchanged files and invalidates on c
 	assert.equal(refreshed.files[filePath].messages[0][2], 1);
 });
 
-test("collectUsageData evicts cache entries for deleted files", async (t) => {
+test("collectUsageDataLegacy evicts cache entries for deleted files", async (t) => {
 	const { sessionsDir, cachePath } = fixture(t);
 	const keepPath = join(sessionsDir, "keep.jsonl");
 	const dropPath = join(sessionsDir, "drop.jsonl");
@@ -760,16 +760,27 @@ test("collectUsageData evicts cache entries for deleted files", async (t) => {
 		[sessionLine("s2", TS_TODAY), assistantLine({ ts: TS_TODAY + 1000, cost: 10 })].join("\n") + "\n"
 	);
 
-	const first = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const first = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(first.allTime.totals.cost, 11);
 
 	rmSync(dropPath);
-	const second = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const second = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(second.allTime.totals.cost, 1);
 
 	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
 	assert.ok(cacheJson.files[keepPath]);
 	assert.equal(cacheJson.files[dropPath], undefined);
+});
+
+test("collectUsageData drops deleted files from its incremental index", async (t) => {
+	const { sessionsDir, cachePath } = fixture(t);
+	const keepPath = join(sessionsDir, "keep.jsonl");
+	const dropPath = join(sessionsDir, "drop.jsonl");
+	writeFileSync(keepPath, [sessionLine("s1", TS_TODAY), assistantLine({ ts: TS_TODAY, cost: 1 })].join("\n") + "\n");
+	writeFileSync(dropPath, [sessionLine("s2", TS_TODAY), assistantLine({ ts: TS_TODAY + 1000, cost: 10 })].join("\n") + "\n");
+	assert.equal((await collectUsageData({ sessionsDir, cachePath, now: NOW })).allTime.totals.cost, 11);
+	rmSync(dropPath);
+	assert.equal((await collectUsageData({ sessionsDir, cachePath, now: NOW })).allTime.totals.cost, 1);
 });
 
 test("collectUsageData survives a corrupt cache file", async (t) => {
@@ -783,9 +794,10 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 	const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
 	assert.equal(data.allTime.totals.cost, 1);
 
-	// Cache was rebuilt.
-	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-	assert.equal(cacheJson.version, 7);
+	// The unusable legacy cache is ignored and a fresh one is rebuilt by the legacy collector.
+	const legacy = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
+	assert.equal(legacy.allTime.totals.cost, 1);
+	assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 7);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -1115,7 +1127,7 @@ test("collectUsageData reports first-run, update, and rebuild progress modes", a
 		join(sessionsDir, "b.jsonl"),
 		[sessionLine("s2", TS_TODAY), assistantLine({ ts: TS_TODAY + 1000, cost: 2 })].join("\n") + "\n"
 	);
-	const cachedMtimes = Object.values(JSON.parse(readFileSync(cachePath, "utf8")).files).map((f) => f.mtimeMs);
+	const cachedMtimes = [statSync(join(sessionsDir, "a.jsonl")).mtimeMs];
 	events = [];
 	await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => events.push(p) });
 	assert.equal(events[0].mode, "update");
@@ -1124,9 +1136,10 @@ test("collectUsageData reports first-run, update, and rebuild progress modes", a
 	assert.equal(events.at(-1).filesParsed, 1);
 
 	// Rebuild: cache file exists but is unusable (e.g. an older format version).
-	writeFileSync(cachePath, JSON.stringify({ version: 1, names: [], files: {} }));
+	const staleCachePath = join(dirname(cachePath), "stale-cache.json");
+	writeFileSync(staleCachePath, JSON.stringify({ version: 1, names: [], files: {} }));
 	events = [];
-	await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => events.push(p) });
+	await collectUsageData({ sessionsDir, cachePath: staleCachePath, now: NOW, onProgress: (p) => events.push(p) });
 	assert.equal(events[0].mode, "rebuild");
 	assert.equal(events[0].filesToParse, 2);
 	assert.equal(events[0].sinceMs, null);
