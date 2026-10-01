@@ -47,6 +47,12 @@ export interface CoreInternalOptions {
 	watchDebounceMs?: number;
 	/** More dirty paths than this → full discovery instead of per-path stats (default 2000). */
 	maxDirtyPaths?: number;
+	/** Explicit snapshots also re-stat files written within this window (default 15 min): watcher events
+	 * can lag the write that just happened (typically the session asking for /usage), and the hot set is a
+	 * few dozen stats. Background (watcher-triggered) refreshes rely on the dirty set alone. */
+	hotWindowMs?: number;
+	/** At most this many hot files are re-stat'ed per explicit snapshot (newest first; default 256). */
+	maxHotPaths?: number;
 }
 
 interface Changes {
@@ -153,6 +159,8 @@ export class UsageIndexCore {
 			sweepIntervalMs: internal.sweepIntervalMs ?? WATCH_SWEEP_MS,
 			watchDebounceMs: internal.watchDebounceMs ?? WATCH_DEBOUNCE_MS,
 			maxDirtyPaths: internal.maxDirtyPaths ?? 2000,
+			hotWindowMs: internal.hotWindowMs ?? 15 * 60_000,
+			maxHotPaths: internal.maxHotPaths ?? 256,
 		};
 		this.live = options.watch !== false;
 		this.fileKind = makeFileKind(this.options.sessionsDir, this.sources);
@@ -232,7 +240,7 @@ export class UsageIndexCore {
 
 	/** New/changed/removed files: a full discovery (first use, sweep needed, stale, or no healthy watch) or
 	 * just the paths the watcher reported dirty. `present` is the full file set (null for dirty-only). */
-	private async findChanges(signal?: AbortSignal): Promise<Changes | null> {
+	private async findChanges(signal?: AbortSignal, includeHot = false): Promise<Changes | null> {
 		const watcher = this.live ? this.watcher : null;
 		if (watcher && !watcher.healthy) watcher.attach();
 		const trusted = watcher !== null && watcher.healthy && !this.sweepNeeded && this.dirty.size <= this.internal.maxDirtyPaths && performance.now() - this.lastFullAt < this.internal.sweepIntervalMs;
@@ -259,11 +267,12 @@ export class UsageIndexCore {
 			}
 			return { changedFiles, removed, present };
 		}
-		// Dirty-only: nothing dirty means no filesystem access at all.
+		// Dirty-only: nothing dirty means no filesystem access at all (plus the hot set on explicit snapshots).
 		const dirty = this.dirty;
 		const dirs = this.dirtyDirs;
 		this.dirty = new Set();
 		this.dirtyDirs = new Set();
+		if (includeHot) for (const path of this.hotPaths()) dirty.add(path);
 		for (const dir of dirs) await this.expandDirectory(dir, dirty);
 		this.dirtyPathsChecked += dirty.size;
 		const changedFiles: DiscoveredFile[] = [];
@@ -292,9 +301,18 @@ export class UsageIndexCore {
 			);
 		} catch {
 			this.sweepNeeded = true;
-			return this.findChanges(signal);
+			return this.findChanges(signal, includeHot);
 		}
 		return { changedFiles, removed, present: null };
+	}
+
+	/** Records written within the hot window, newest first, capped. */
+	private hotPaths(): string[] {
+		const since = Date.now() - this.internal.hotWindowMs;
+		const hot: Array<[string, number]> = [];
+		for (const [path, r] of this.records) if (r.mtimeMs >= since) hot.push([path, r.mtimeMs]);
+		hot.sort((a, b) => b[1] - a[1]);
+		return hot.slice(0, this.internal.maxHotPaths).map(([path]) => path);
 	}
 
 	/** Bring records, contributions and the ledger up to date with the filesystem. False when aborted. */
@@ -306,7 +324,7 @@ export class UsageIndexCore {
 		return this.exclusive(() => this.refreshNow(options));
 	}
 
-	private async refreshNow(options: Pick<SnapshotOptions, "signal" | "onProgress">): Promise<RefreshResult> {
+	private async refreshNow(options: Pick<SnapshotOptions, "signal" | "onProgress">, includeHot = false): Promise<RefreshResult> {
 		const { signal, onProgress } = options;
 		if (signal?.aborted || this.disposed) return { ok: false, changed: false };
 		const firstLoad = !this.loaded;
@@ -323,7 +341,7 @@ export class UsageIndexCore {
 		if (this.live) this.ensureWatcher();
 		let changes: Changes | null;
 		try {
-			changes = await this.findChanges(signal);
+			changes = await this.findChanges(signal, includeHot);
 		} catch {
 			changes = null;
 			this.sweepNeeded = true;
@@ -444,7 +462,7 @@ export class UsageIndexCore {
 	async snapshot(options: SnapshotOptions = {}): Promise<UsageData | null> {
 		const now = options.now ?? new Date();
 		return this.exclusive(async () => {
-			const result = await this.refreshNow(options);
+			const result = await this.refreshNow(options, true);
 			if (!result.ok) return null;
 			const data = this.ledger.snapshot(now);
 			if (this.internal.persistRollup && this.storeDir) void this.store.writeRollup(buildUsageRollup(data, { now: options.now })).catch(() => {});

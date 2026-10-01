@@ -296,7 +296,8 @@ test("vanished sessions dir and mtime-only touches are handled", async (t) => {
 
 test("watched core: a warm refresh touches no filesystem; appends, new files and deletes are found from dirty paths", async (t) => {
 	const f = fixture(t, 10, 13);
-	const core = new UsageIndexCore({ sessionsDir: f.sessionsDir, storeDir: null, legacyCachePath: null, worker: false, parseWorkers: 0 });
+	// hotWindowMs 0: this test isolates the dirty-path mechanism (the hot set has its own test).
+	const core = new UsageIndexCore({ sessionsDir: f.sessionsDir, storeDir: null, legacyCachePath: null, worker: false, parseWorkers: 0 }, { hotWindowMs: 0 });
 	t.after(() => core.dispose());
 	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "first");
 	assert.equal(core.fullSweeps, 1);
@@ -343,4 +344,26 @@ test("watched core: new and vanished directories are expanded from dirty paths, 
 	await sleep(400);
 	assertUsageDataEqual(await core.snapshot({ now: NOW }), await legacy(f.sessionsDir), "removed dir");
 	assert.equal(core.fullSweeps, sweeps);
+});
+
+test("core: an explicit snapshot sees a write the watcher has not reported yet (hot set)", async (t) => {
+	const f = fixture(t, 8, 31);
+	// Watching on, but the watch debounce and sweep are far away: only the hot set can see the append.
+	const core = new UsageIndexCore(coreOptions(f, { watch: true }), { watchDebounceMs: 3_600_000, sweepIntervalMs: 3_600_000 });
+	t.after(() => core.dispose());
+	await core.snapshot({ now: NOW });
+	await core.snapshot({ now: NOW }); // now trusted (healthy watcher, fresh sweep)
+	const sweeps = core.fullSweeps;
+	// Make one file "recent", then append to it and snapshot immediately (before any fs event is processed).
+	const recent = f.files[2];
+	appendTurns(recent, 3, 77, NOW.getTime() - 2000);
+	core["dirty"].clear(); // drop any event that did arrive: this models a watcher that lags the write
+	const data = await core.snapshot({ now: NOW });
+	assert.equal(core.fullSweeps, sweeps, "no full discovery was needed");
+	assertUsageDataEqual(data, await legacy(f.sessionsDir), "hot set");
+	// A background refresh (the watcher path) stays dirty-only: nothing reported → no stats at all.
+	const checked = core.dirtyPathsChecked;
+	core["dirty"].clear();
+	await core.refresh();
+	assert.equal(core.dirtyPathsChecked, checked, "background refresh does not stat the hot set");
 });
