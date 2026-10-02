@@ -20,7 +20,7 @@
  * 15 minutes (true for every real local midnight since standardised time zones).
  */
 import { computeInsights, CTX_LOW_THRESHOLD, CTX_TAX_THRESHOLD, DAY_MS, emptyModelStats, emptyPeriodRawData, emptyProviderStats, emptyUsageData, EXCLUDED_PROVIDERS, HOUR_MS, makeHourlyKey, TAB_ORDER } from "../data.ts";
-import type { HourlyCell, MessageMeta, MissKind, PeriodBounds, PeriodRawData, SessionMessage, TabName, TrendInfo, UsageData } from "../data.ts";
+import type { HourlyCell, InsightDays, MessageMeta, MissKind, PeriodBounds, PeriodRawData, SessionMessage, TabName, TrendInfo, UsageData } from "../data.ts";
 import { freeTierUsd, splitCost } from "../sources.ts";
 import type { ContributionDelta, CountedMessage, FileContribution, LedgerStats } from "./types.ts";
 
@@ -430,9 +430,53 @@ export class UsageLedger {
 		}
 		const trend: TrendInfo | null = prior28 > 0 ? { last7Cost: last7, priorWeeklyPace: prior28 / 4 } : null;
 		for (const period of TAB_ORDER) data[period].insights = computeInsights(raw[period], trend);
+		data.insightDays = this.insightDays();
 		return data;
 	}
+
+	/** Insight inputs per local day (native clients compute any window from these). */
+	private insightDays(): InsightDays {
+		const dayOfQ = new Map<number, string>();
+		const day = (q: number): string => {
+			let d = dayOfQ.get(q);
+			if (d === undefined) {
+				const t = new Date(q * QUARTER_MS);
+				d = `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, "0")}-${String(t.getDate()).padStart(2, "0")}`;
+				dayOfQ.set(q, d);
+			}
+			return d;
+		};
+		const raw = new Map<string, number[]>();
+		for (const q of this.sortedQ) {
+			const v = this.buckets.get(q)!.raw;
+			const d = day(q);
+			let a = raw.get(d);
+			if (!a) raw.set(d, (a = new Array(INSIGHT_RAW.length).fill(0)));
+			for (let i = 0; i < INSIGHT_RAW.length; i++) a[i]! += v[INSIGHT_RAW[i]!]!;
+		}
+		const projects = new Map<string, Map<string, number>>();
+		const sessions = new Map<string, Map<string, number>>();
+		const into = (m: Map<string, Map<string, number>>, d: string, k: string, c: number): void => {
+			let inner = m.get(d);
+			if (!inner) m.set(d, (inner = new Map()));
+			inner.set(k, (inner.get(k) ?? 0) + c);
+		};
+		for (const f of this.files.values()) {
+			for (const [q, fb] of f.buckets) {
+				if (q === UNDATED) continue;
+				const c = fb.raw[R_TOTAL]!;
+				if (c === 0 && fb.raw[R_N]! <= 0) continue;
+				const d = day(q);
+				into(projects, d, f.project, c);
+				into(sessions, d, f.sessionId, c);
+			}
+		}
+		return { raw, projects, sessions };
+	}
 }
+
+/** Raw-vector slots exported per day, in `InsightDays.raw` order. */
+const INSIGHT_RAW = [R_ASSISTANT, R_AUX, R_CTX_HIGH_COST, R_CTX_HIGH_N, R_CTX_LOW_COST, R_CTX_LOW_N, R_UPFRONT, R_REASONING, R_OUTPUT, R_CACHE_READ, R_FRESH];
 
 function addTo(map: Map<string, number>, key: string, value: number): void {
 	map.set(key, (map.get(key) ?? 0) + value);

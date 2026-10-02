@@ -241,6 +241,18 @@ export interface UsageData {
 	/** Deduped usage bucketed by hour start (ms) → series key → metrics. */
 	hourly: Map<number, Map<HourlyKey, HourlyCell>>;
 	bounds: PeriodBounds;
+	/** Per local day insight inputs for native clients (usage index only; absent on the legacy path). */
+	insightDays?: InsightDays;
+}
+
+/** Insight inputs per local calendar day ("YYYY-MM-DD"), so a native client can compute any window's insights. */
+export interface InsightDays {
+	/** Day → [assistantCost, auxCost, ctxHighCost, ctxHighN, ctxLowCost, ctxLowN, upfrontCost, reasoning, output, cacheRead, fresh]. */
+	raw: Map<string, number[]>;
+	/** Day → project label → cost. */
+	projects: Map<string, Map<string, number>>;
+	/** Day → session id → cost. */
+	sessions: Map<string, Map<string, number>>;
 }
 
 export type TabName = "today" | "thisWeek" | "lastWeek" | "last30Days" | "allTime";

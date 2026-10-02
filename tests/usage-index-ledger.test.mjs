@@ -175,6 +175,30 @@ test("incremental replace/append/remove/reset sequences equal a ledger rebuilt f
 	}
 });
 
+test("insightDays: per-day insight inputs add up to the all-time totals", () => {
+	const ledger = new UsageLedger();
+	const r = rng(11);
+	const files = [
+		{ path: "/a", kind: "pi", sessionId: "a", project: "proj-a", counted: counted(r, 40, NOW.getTime() - 5 * DAY, DAY) },
+		{ path: "/b", kind: "pi", sessionId: "b", project: "proj-b", counted: counted(r, 25, NOW.getTime() - 2 * DAY, DAY) },
+	];
+	ledger.apply({ reset: true, replaced: files, appended: [], removed: [] });
+	const snap = ledger.snapshot(NOW);
+	const d = snap.insightDays;
+	assert.ok(d && d.raw.size > 0);
+	let assistant = 0, aux = 0, proj = 0, sess = 0;
+	for (const v of d.raw.values()) { assistant += v[0]; aux += v[1]; }
+	for (const m of d.projects.values()) for (const c of m.values()) proj += c;
+	for (const m of d.sessions.values()) for (const c of m.values()) sess += c;
+	// dated usage only (undated messages count toward all-time but have no day)
+	let total = 0;
+	for (const h of snap.hourly.values()) for (const c of h.values()) total += c.cost;
+	const near = (x, y) => Math.abs(x - y) <= 1e-6 * Math.max(1, Math.abs(y));
+	assert.ok(near(assistant + aux, total), `${assistant + aux} vs ${total}`);
+	assert.ok(near(proj, total) && near(sess, total));
+	assert.deepEqual(new Set([...d.projects.values()].flatMap((m) => [...m.keys()])), new Set(["proj-a", "proj-b"]));
+});
+
 test("snapshot returns fresh objects", () => {
 	const ledger = new UsageLedger();
 	ledger.apply({ reset: true, replaced: [{ path: "/a", kind: "pi", sessionId: "a", project: "p", counted: counted(rng(5), 30, NOW.getTime() - DAY, DAY) }], appended: [], removed: [] });

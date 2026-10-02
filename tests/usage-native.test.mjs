@@ -211,3 +211,25 @@ test("index.ts wires the flow's surface onto the /usage component", () => {
 	assert.match(src, /createUsageFlow\(/);
 	assert.doesNotMatch(src, /loader\.setMessage\(`/);
 });
+
+test("rollup.insights: per-day insight inputs, projects and anonymous sessions", () => {
+	const t = new Date(2026, 6, 14, 10).getTime();
+	const hourly = new Map([[t, new Map([[makeHourlyKey("anthropic", "claude-fable-5", ""), cell({ messages: 2, cost: 3, estCost: 3, input: 10 })]])]]);
+	const data = fakeData(hourly);
+	data.insightDays = {
+		raw: new Map([["2026-07-14", [2.5, 0.5, 1, 1, 0.25, 1, 0.75, 40, 400, 9000, 20]]]),
+		projects: new Map([["2026-07-14", new Map([["~/a", 2], ["~/b", 1]])]]),
+		sessions: new Map([["2026-07-14", new Map([["s1", 2], ["s2", 1]])]]),
+	};
+	const { rollup } = buildUsageRollup(data);
+	const di = rollup.days.indexOf("2026-07-14");
+	assert.ok(di >= 0);
+	assert.deepEqual(rollup.insights.dayFields.slice(0, 2), ["assistant", "aux"]);
+	assert.deepEqual(rollup.insights.dayRows, [[di, 2.5, 0.5, 1, 1, 0.25, 1, 0.75, 40, 400, 9000, 20]]);
+	assert.deepEqual(rollup.insights.projects, ["~/a", "~/b"]);
+	assert.deepEqual(rollup.insights.projectRows, [[di, 0, 2], [di, 1, 1]]);
+	assert.deepEqual(rollup.insights.sessionRows, [[di, 0, 2], [di, 1, 1]]);
+	assert.equal(JSON.stringify(rollup).includes("s1"), false, "session ids never leave the extension");
+	// legacy data (no insightDays): no block
+	assert.equal(buildUsageRollup(fakeData(hourly)).rollup.insights, undefined);
+});

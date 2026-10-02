@@ -64,6 +64,25 @@ export interface UsageRollup {
 	reporting: string[];
 	fields: string[];
 	rows: number[][];
+	/** Insight inputs per day (optional, additive to v1; absent on the legacy collection path). */
+	insights?: UsageRollupInsights;
+}
+
+/** Field names of `UsageRollupInsights.dayRows[2...]`... see INSIGHT_DAY_FIELDS. */
+export const INSIGHT_DAY_FIELDS = ["assistant", "aux", "ctxHiC", "ctxHiN", "ctxLoC", "ctxLoN", "upfront", "reasoning", "output", "cacheRead", "fresh"] as const;
+const INSIGHT_MONEY = new Set<string>(["assistant", "aux", "ctxHiC", "ctxLoC", "upfront"]);
+
+export interface UsageRollupInsights {
+	/** Names of `dayRows[i][1...]`. */
+	dayFields: string[];
+	/** `[dayIndex, value(dayFields[0]), …]`; sparse (days with usage). */
+	dayRows: number[][];
+	/** Project labels (worktrees collapse into their repository). */
+	projects: string[];
+	/** `[dayIndex, projectIndex, cost]`. */
+	projectRows: number[][];
+	/** `[dayIndex, sessionIndex, cost]`: sessions are anonymous indices (only counts and concentration are needed). */
+	sessionRows: number[][];
 }
 
 export interface UsageNativeRollupPayload {
@@ -195,18 +214,68 @@ export function buildUsageRollup(data: UsageData, options: { now?: Date } = {}):
 		if (nonZero) rows.push(row);
 	}
 
-	return {
-		kind: USAGE_NATIVE_KIND,
-		v: USAGE_NATIVE_VERSION,
-		rollup: {
-			generatedAt: new Date(nowMs).toISOString(),
-			days,
-			keys,
-			reporting: Array.from(rates.reporting).filter((p) => p !== "mock"),
-			fields: [...ROLLUP_FIELDS],
-			rows,
-		},
+	const rollup: UsageRollup = {
+		generatedAt: new Date(nowMs).toISOString(),
+		days,
+		keys,
+		reporting: Array.from(rates.reporting).filter((p) => p !== "mock"),
+		fields: [...ROLLUP_FIELDS],
+		rows,
 	};
+	if (data.insightDays) rollup.insights = buildInsights(data.insightDays, dayIndex);
+	return { kind: USAGE_NATIVE_KIND, v: USAGE_NATIVE_VERSION, rollup };
+}
+
+function buildInsights(src: NonNullable<UsageData["insightDays"]>, dayIndex: Map<string, number>): UsageRollupInsights {
+	const dayRows: number[][] = [];
+	for (const [day, values] of src.raw) {
+		const di = dayIndex.get(day);
+		if (di === undefined) continue;
+		const row = [di];
+		let nonZero = false;
+		values.forEach((v, i) => {
+			const r = INSIGHT_MONEY.has(INSIGHT_DAY_FIELDS[i]!) ? round6(v) : Math.round(v);
+			if (r !== 0) nonZero = true;
+			row.push(r === 0 ? 0 : r);
+		});
+		if (nonZero) dayRows.push(row);
+	}
+	dayRows.sort((x, y) => x[0]! - y[0]!);
+	const projects: string[] = [];
+	const projectIndex = new Map<string, number>();
+	const projectRows: number[][] = [];
+	const sessionIndex = new Map<string, number>();
+	const sessionRows: number[][] = [];
+	for (const [day, byProject] of src.projects) {
+		const di = dayIndex.get(day);
+		if (di === undefined) continue;
+		for (const [label, cost] of byProject) {
+			const c = round6(cost);
+			if (c === 0) continue;
+			let pi = projectIndex.get(label);
+			if (pi === undefined) {
+				pi = projects.length;
+				projectIndex.set(label, pi);
+				projects.push(label);
+			}
+			projectRows.push([di, pi, c]);
+		}
+	}
+	for (const [day, bySession] of src.sessions) {
+		const di = dayIndex.get(day);
+		if (di === undefined) continue;
+		for (const [id, cost] of bySession) {
+			let si = sessionIndex.get(id);
+			if (si === undefined) {
+				si = sessionIndex.size;
+				sessionIndex.set(id, si);
+			}
+			sessionRows.push([di, si, round6(cost) || 0]);
+		}
+	}
+	projectRows.sort((x, y) => x[0]! - y[0]! || x[1]! - y[1]!);
+	sessionRows.sort((x, y) => x[0]! - y[0]! || x[1]! - y[1]!);
+	return { dayFields: [...INSIGHT_DAY_FIELDS], dayRows, projects, projectRows, sessionRows };
 }
 
 /** Attach a `surfaceData` accessor (function form) to a component. */

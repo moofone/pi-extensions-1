@@ -97,6 +97,11 @@ export function appendTurns(file, n, seed, startTs = Date.now() - 600_000) {
 }
 
 export function normalizeUsageData(data) {
+	// insightDays is ledger-only (native clients); the legacy oracle has no equivalent
+	if (data && typeof data === "object" && "insightDays" in data) {
+		const { insightDays: _skip, ...rest } = data;
+		data = rest;
+	}
 	const norm = (v) => {
 		if (v instanceof Map) return [...v.entries()].map(([k, x]) => [String(k), norm(x)]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 		if (v instanceof Set) return [...v].map(String).sort();
