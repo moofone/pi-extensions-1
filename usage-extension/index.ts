@@ -13,8 +13,12 @@ import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-wor
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { CancellableLoader, Container, Spacer, matchesKey, visibleWidth, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-import { collectUsageData, getAgentDir, TAB_ORDER } from "./data";
-import type { CollectProgress } from "./data";
+import { compareNamedSeries, formatCacheHitPercent, getAgentDir, TAB_ORDER } from "./data";
+import { getUsageIndex } from "./index/client";
+import { createUsageFlow, INITIAL_LOADING_MESSAGE } from "./usage-flow";
+import type { UsageFlow } from "./usage-flow";
+import { parseUsageSourcesSetting } from "./sources";
+import type { ResolvedUsageSources } from "./sources";
 import type { BaseStats, ProviderStats, TabName, TotalStats, UsageData } from "./data";
 import {
 	buildGraphModel,
@@ -26,9 +30,24 @@ import {
 	TOTAL_SERIES_KEY,
 } from "./graph";
 import type { GraphGroupBy, GraphMetric, GraphModel } from "./graph";
+import { DEFAULT_TOP_N, MAX_TOP_N, MIN_TOP_N, STACK_GROUP_ORDER, STACK_METRIC_ORDER } from "./bars";
+import type { StackGroupBy, StackMetric } from "./bars";
+import { CACHE_CHART_ORDER, buildInputRates } from "./cache";
+import type { CacheChart, CacheGroupBy, InputRates } from "./cache";
 import {
+	cacheModelFor,
+	dailyStackFor,
+	planFor,
+	renderCacheView,
+	renderDailyView,
+	resolveCursor,
+} from "./dashboard";
+import type { Memo } from "./dashboard";
+import {
+	buildCacheCsv,
 	buildGraphCsv,
 	buildInsightsJson,
+	buildStackCsv,
 	buildTableCsv,
 	exportFileName,
 	parseExportDirSetting,
@@ -38,15 +57,22 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-type ViewMode = "table" | "insights" | "graph";
+type ViewMode = "daily" | "cache" | "graph" | "table" | "insights";
 
-const VIEW_CYCLE: ViewMode[] = ["graph", "table", "insights"];
+const VIEW_CYCLE: ViewMode[] = ["daily", "cache", "graph", "table", "insights"];
 
 const VIEW_LABELS: Record<ViewMode, string> = {
-	graph: "Graphs",
+	daily: "Daily",
+	cache: "Cache",
+	graph: "Trends",
 	table: "Table",
 	insights: "Insights",
 };
+
+/** Rows used by the frame around a view (borders, title, tabs, help). */
+const FRAME_ROWS = 12;
+/** Bound on memoized models; cleared wholesale when exceeded. */
+const MEMO_LIMIT = 96;
 
 // =============================================================================
 // Column Configuration
@@ -69,14 +95,24 @@ interface TableLayout {
 	columns: DataColumn[];
 	nameWidth: number;
 	tableWidth: number;
+	/** Spaces between columns, chosen by getTableLayout (COLUMN_GAP, or 1 when
+	 * the wider gap would cost a column). Always >= 1 so cells cannot fuse. */
+	gap: number;
 	compact: boolean;
 }
 
 const MAX_NAME_COL_WIDTH = 26;
 
+// Explicit separator between every pair of columns (name→first column and
+// column→column). Right-aligned padding alone cannot guarantee a gap: a value
+// exactly as wide as its column leaves zero leading spaces, which fused the
+// Total row's `$10480 ($10000)` against the Msgs count. The gap is paid for by
+// trimming the slack-heavy numeric columns below.
+const COLUMN_GAP = 2;
+
 const SESSIONS_COLUMN: DataColumn = {
 	label: "Sessions",
-	width: 9,
+	width: 8,
 	getValue: (s) => formatNumber(typeof s.sessions === "number" ? s.sessions : s.sessions.size),
 };
 
@@ -88,19 +124,26 @@ const MSGS_COLUMN: DataColumn = {
 
 const COST_COLUMN: DataColumn = {
 	label: "Cost",
-	width: 9,
-	getValue: (s) => formatCost(s.cost),
+	width: 15,
+	// Free-tier models (e.g. devin swe-2) record real token usage with an
+	// explicit $0 cost — show the catalog-priced equivalent with the actual
+	// charge in parens: "$12.50 ($0)" = burned $12.50 of free tokens.
+	getValue: (s) => {
+		if (s.estCost > s.cost) return `${formatCost(s.estCost)} (${s.cost === 0 ? "$0" : formatCost(s.cost)})`;
+		if (s.cost === 0 && hasRecordedTokens(s)) return "$0";
+		return formatCost(s.cost);
+	},
 };
 
 const TOKENS_COLUMN: DataColumn = {
 	label: "Tokens",
-	width: 9,
+	width: 7,
 	getValue: (s) => formatTokens(s.tokens.total),
 };
 
 const INPUT_COLUMN: DataColumn = {
 	label: "↑In",
-	width: 8,
+	width: 6,
 	dimmed: true,
 	// Include cacheWrite so this reflects fresh input tokens sent this turn,
 	// even for providers like Anthropic that split cached prompt creation out
@@ -110,30 +153,38 @@ const INPUT_COLUMN: DataColumn = {
 
 const OUTPUT_COLUMN: DataColumn = {
 	label: "↓Out",
-	width: 8,
+	width: 6,
 	dimmed: true,
 	getValue: (s) => formatTokens(s.tokens.output),
 };
 
 const CACHE_COLUMN: DataColumn = {
 	label: "Cache",
-	width: 8,
+	width: 6,
 	dimmed: true,
 	getValue: (s) => formatTokens(s.tokens.cacheRead + s.tokens.cacheWrite),
 };
 
-const FULL_DATA_COLUMNS: DataColumn[] = [
+const HIT_COLUMN: DataColumn = {
+	label: "Hit%",
+	width: 5,
+	getValue: (s) => formatCacheHitPercent(s.tokens),
+};
+
+const PRIMARY_DATA_COLUMNS: DataColumn[] = [
 	SESSIONS_COLUMN,
 	MSGS_COLUMN,
 	COST_COLUMN,
 	TOKENS_COLUMN,
 	INPUT_COLUMN,
 	OUTPUT_COLUMN,
-	CACHE_COLUMN,
+	HIT_COLUMN,
 ];
+const FULL_DATA_COLUMNS: DataColumn[] = [...PRIMARY_DATA_COLUMNS.slice(0, -1), CACHE_COLUMN, HIT_COLUMN];
 
 const TABLE_LAYOUTS: TableLayoutCandidate[] = [
 	{ columns: FULL_DATA_COLUMNS, minNameWidth: MAX_NAME_COL_WIDTH },
+	{ columns: PRIMARY_DATA_COLUMNS, minNameWidth: MAX_NAME_COL_WIDTH },
 	{ columns: [SESSIONS_COLUMN, MSGS_COLUMN, COST_COLUMN, TOKENS_COLUMN], minNameWidth: 14, compact: true },
 	{ columns: [SESSIONS_COLUMN, COST_COLUMN, TOKENS_COLUMN], minNameWidth: 12, compact: true },
 	{ columns: [COST_COLUMN, TOKENS_COLUMN], minNameWidth: 10, compact: true },
@@ -143,6 +194,11 @@ const TABLE_LAYOUTS: TableLayoutCandidate[] = [
 // =============================================================================
 // Formatting Helpers
 // =============================================================================
+
+/** True when the row carries recorded token usage (any bucket, cache included). */
+function hasRecordedTokens(s: { tokens: { total: number; cacheRead: number; cacheWrite: number } }): boolean {
+	return s.tokens.total + s.tokens.cacheRead + s.tokens.cacheWrite > 0;
+}
 
 function formatCost(cost: number): string {
 	if (cost === 0) return "-";
@@ -193,18 +249,6 @@ function seriesColor(index: number): string {
 	return SERIES_COLORS[index % SERIES_COLORS.length]!;
 }
 
-/** "14:32" if the timestamp is today, otherwise "16 Jul" (with year if not this year). */
-function formatSinceDate(ms: number): string {
-	const d = new Date(ms);
-	const now = new Date();
-	if (d.toDateString() === now.toDateString()) {
-		return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-	}
-	const opts: Intl.DateTimeFormatOptions = { day: "numeric", month: "short" };
-	if (d.getFullYear() !== now.getFullYear()) opts.year = "numeric";
-	return d.toLocaleDateString(undefined, opts);
-}
-
 function padLeft(s: string, len: number): string {
 	const vis = visibleWidth(s);
 	if (vis >= len) return s;
@@ -241,26 +285,36 @@ function pickFittingText(width: number, variants: string[]): string {
 function getTableLayout(width: number): TableLayout {
 	const safeWidth = Math.max(width, 0);
 
+	// Layout preference wins over gap size: try each layout with the full
+	// COLUMN_GAP first, then with a single space, keeping the primary seven
+	// columns (including Hit%) when Cache volume does not fit.
+	// A gap of at least 1 is what makes fusion impossible — the earlier zero-gap
+	// bug came from relying on right-alignment padding, which vanishes when a
+	// value is exactly as wide as its column.
 	for (const candidate of TABLE_LAYOUTS) {
-		const columnsWidth = sumColumnWidths(candidate.columns);
-		const nameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - columnsWidth, 0));
-		if (nameWidth >= candidate.minNameWidth) {
-			return {
-				columns: candidate.columns,
-				nameWidth,
-				tableWidth: nameWidth + columnsWidth,
-				compact: candidate.compact ?? false,
-			};
+		for (const gap of [COLUMN_GAP, 1]) {
+			const columnsWidth = sumColumnWidths(candidate.columns) + gap * candidate.columns.length;
+			const nameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - columnsWidth, 0));
+			if (nameWidth >= candidate.minNameWidth) {
+				return {
+					columns: candidate.columns,
+					nameWidth,
+					tableWidth: nameWidth + columnsWidth,
+					gap,
+					compact: candidate.compact ?? false,
+				};
+			}
 		}
 	}
 
 	const fallback = TABLE_LAYOUTS[TABLE_LAYOUTS.length - 1]!;
-	const fallbackColumnsWidth = sumColumnWidths(fallback.columns);
+	const fallbackColumnsWidth = sumColumnWidths(fallback.columns) + 1 * fallback.columns.length;
 	const fallbackNameWidth = Math.min(MAX_NAME_COL_WIDTH, Math.max(safeWidth - fallbackColumnsWidth, 0));
 	return {
 		columns: fallback.columns,
 		nameWidth: fallbackNameWidth,
 		tableWidth: fallbackNameWidth + fallbackColumnsWidth,
+		gap: 1,
 		compact: fallback.compact ?? false,
 	};
 }
@@ -278,8 +332,8 @@ const TAB_LABELS: Record<TabName, string> = {
 };
 
 class UsageComponent {
-	private activeTab: TabName = "allTime";
-	private viewMode: ViewMode = "graph";
+	private activeTab: TabName = "last30Days";
+	private viewMode: ViewMode = "daily";
 	private data: UsageData;
 	private selectedIndex = 0;
 	private expanded = new Set<string>();
@@ -299,18 +353,107 @@ class UsageComponent {
 	private graphHidden = new Set<string>();
 	private graphLegendIndex = 0;
 
-	constructor(theme: Theme, data: UsageData, requestRender: () => void, done: () => void) {
+	// Daily (stacked bars) + Cache view state. The bucket cursor is shared so
+	// flipping between the two keeps the same day selected.
+	private dailyMetric: StackMetric = "cost";
+	private dailyGroupBy: StackGroupBy = "provider";
+	private dailyTopN = DEFAULT_TOP_N;
+	private cacheChart: CacheChart = "cost";
+	private cacheGroupBy: CacheGroupBy = "provider";
+	private bucketCursor: number | null = null;
+	private lastWidth = 100;
+	private getRows: () => number;
+
+	// Models are pure functions of (data, view state, width); memoize them so
+	// keypresses and re-renders never re-aggregate the hourly buckets.
+	private memoStore = new Map<string, unknown>();
+	private inputRates: InputRates | null = null;
+	private renderCache: { key: string; lines: string[] } | null = null;
+	private readonly memo: Memo = <T>(key: string, build: () => T): T => {
+		if (this.memoStore.has(key)) return this.memoStore.get(key) as T;
+		if (this.memoStore.size >= MEMO_LIMIT) this.memoStore.clear();
+		const value = build();
+		this.memoStore.set(key, value);
+		return value;
+	};
+
+	constructor(theme: Theme, data: UsageData, requestRender: () => void, done: () => void, getRows: () => number = () => 40) {
 		this.theme = theme;
 		this.requestRender = requestRender;
 		this.done = done;
 		this.data = data;
+		this.getRows = getRows;
 		this.updateProviderOrder();
+	}
+
+	private rates(): InputRates {
+		if (!this.inputRates) this.inputRates = buildInputRates(this.data.hourly);
+		return this.inputRates;
+	}
+
+	private dailyState() {
+		return {
+			period: this.activeTab,
+			metric: this.dailyMetric,
+			groupBy: this.dailyGroupBy,
+			topN: this.dailyTopN,
+			cursor: this.bucketCursor,
+		};
+	}
+
+	private cacheState() {
+		return { period: this.activeTab, chart: this.cacheChart, groupBy: this.cacheGroupBy, cursor: this.bucketCursor };
+	}
+
+	/** Move the shared bucket cursor; returns false when the view has no buckets. */
+	private moveCursor(delta: number | "start" | "end"): boolean {
+		const plan = planFor(this.memo, this.data, this.activeTab, this.lastWidth);
+		if (plan.buckets.length === 0) return false;
+		const current = resolveCursor(plan, this.bucketCursor);
+		if (delta === "start") this.bucketCursor = 0;
+		else if (delta === "end") this.bucketCursor = plan.buckets.length - 1;
+		else this.bucketCursor = Math.max(0, Math.min(plan.buckets.length - 1, current + delta));
+		return true;
+	}
+
+	private handleBarsInput(data: string): boolean {
+		if (matchesKey(data, "left") || data === "h") {
+			this.moveCursor(-1);
+		} else if (matchesKey(data, "right") || data === "l") {
+			this.moveCursor(1);
+		} else if (matchesKey(data, "home") || data === "0") {
+			this.moveCursor("start");
+		} else if (matchesKey(data, "end") || data === "$") {
+			this.moveCursor("end");
+		} else if (data === "t") {
+			this.bucketCursor = null; // back to "now"
+		} else if (this.viewMode === "daily" && matchesKey(data, "m")) {
+			const idx = STACK_METRIC_ORDER.indexOf(this.dailyMetric);
+			this.dailyMetric = STACK_METRIC_ORDER[(idx + 1) % STACK_METRIC_ORDER.length]!;
+		} else if (this.viewMode === "daily" && matchesKey(data, "g")) {
+			const idx = STACK_GROUP_ORDER.indexOf(this.dailyGroupBy);
+			this.dailyGroupBy = STACK_GROUP_ORDER[(idx + 1) % STACK_GROUP_ORDER.length]!;
+		} else if (this.viewMode === "daily" && (data === "+" || data === "=")) {
+			this.dailyTopN = Math.min(MAX_TOP_N, this.dailyTopN + 1);
+		} else if (this.viewMode === "daily" && (data === "-" || data === "_")) {
+			this.dailyTopN = Math.max(MIN_TOP_N, this.dailyTopN - 1);
+		} else if (this.viewMode === "cache" && matchesKey(data, "m")) {
+			const idx = CACHE_CHART_ORDER.indexOf(this.cacheChart);
+			this.cacheChart = CACHE_CHART_ORDER[(idx + 1) % CACHE_CHART_ORDER.length]!;
+		} else if (this.viewMode === "cache" && matchesKey(data, "g")) {
+			this.cacheGroupBy = this.cacheGroupBy === "provider" ? "model" : "provider";
+		} else {
+			return false;
+		}
+		this.exportNote = null;
+		this.requestRender();
+		return true;
 	}
 
 	private updateProviderOrder(): void {
 		const stats = this.data[this.activeTab];
 		this.providerOrder = Array.from(stats.providers.entries())
-			.sort((a, b) => b[1].cost - a[1].cost)
+			.sort((a, b) => compareNamedSeries(a[0], a[1].cost, b[0], b[1].cost))
 			.map(([name]) => name);
 		this.clampTableSelection();
 	}
@@ -343,6 +486,7 @@ class UsageComponent {
 			const synth: ProviderStats = {
 				messages: 0,
 				cost: 0,
+				estCost: 0,
 				tokens: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				sessions: new Set<string>(),
 				models,
@@ -350,6 +494,7 @@ class UsageComponent {
 			for (const model of models.values()) {
 				synth.messages += model.messages;
 				synth.cost += model.cost;
+				synth.estCost += model.estCost;
 				synth.tokens.total += model.tokens.total;
 				synth.tokens.input += model.tokens.input;
 				synth.tokens.output += model.tokens.output;
@@ -365,12 +510,14 @@ class UsageComponent {
 			sessions: 0,
 			messages: 0,
 			cost: 0,
+			estCost: 0,
 			tokens: { total: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		};
 		const sessions = new Set<string>();
 		for (const provider of providers.values()) {
 			totals.messages += provider.messages;
 			totals.cost += provider.cost;
+			totals.estCost += provider.estCost;
 			totals.tokens.total += provider.tokens.total;
 			totals.tokens.input += provider.tokens.input;
 			totals.tokens.output += provider.tokens.output;
@@ -423,19 +570,27 @@ class UsageComponent {
 			return;
 		}
 
-		if (matchesKey(data, "tab") || matchesKey(data, "right")) {
+		// Daily/Cache: ←→ move the bucket cursor, so periods are Tab/Shift+Tab only.
+		const barsView = this.viewMode === "daily" || this.viewMode === "cache";
+		if (barsView && this.handleBarsInput(data)) {
+			return;
+		}
+
+		if (matchesKey(data, "tab") || (!barsView && matchesKey(data, "right"))) {
 			const idx = TAB_ORDER.indexOf(this.activeTab);
 			this.activeTab = TAB_ORDER[(idx + 1) % TAB_ORDER.length]!;
+			this.bucketCursor = null;
 			this.updateProviderOrder();
 			this.exportNote = null;
 			this.requestRender();
-		} else if (matchesKey(data, "shift+tab") || matchesKey(data, "left")) {
+		} else if (matchesKey(data, "shift+tab") || (!barsView && matchesKey(data, "left"))) {
 			const idx = TAB_ORDER.indexOf(this.activeTab);
 			this.activeTab = TAB_ORDER[(idx - 1 + TAB_ORDER.length) % TAB_ORDER.length]!;
+			this.bucketCursor = null;
 			this.updateProviderOrder();
 			this.exportNote = null;
 			this.requestRender();
-		} else if (this.viewMode === "graph") {
+		} else if (barsView || this.viewMode === "graph") {
 			// Graph-specific keys were handled above; swallow table-only keys.
 		} else if (this.viewMode === "table" && data === "/") {
 			this.tableFilterEditing = true;
@@ -518,7 +673,18 @@ class UsageComponent {
 		let name: string;
 		let content: string;
 		const stats = this.data[this.activeTab];
-		if (this.viewMode === "graph") {
+		if (this.viewMode === "daily") {
+			const slice = `${this.dailyMetric}-by-${this.dailyGroupBy}-top${this.dailyTopN}`;
+			name = exportFileName("daily", this.activeTab, slice, "csv", now);
+			content = buildStackCsv(dailyStackFor(this.memo, this.data, this.dailyState(), this.lastWidth));
+		} else if (this.viewMode === "cache") {
+			const plan = planFor(this.memo, this.data, this.activeTab, this.lastWidth);
+			name = exportFileName("cache", this.activeTab, `by-${this.cacheGroupBy}`, "csv", now);
+			content = buildCacheCsv(
+				cacheModelFor(this.memo, this.data, this.cacheState(), this.lastWidth, this.rates()),
+				plan.buckets.map((b) => b.startMs)
+			);
+		} else if (this.viewMode === "graph") {
 			const slice = `${this.graphCumulative ? "cumulative" : "per-bucket"}-${this.graphMetric}-by-${this.graphGroupBy}`;
 			name = exportFileName("graph", this.activeTab, slice, "csv", now);
 			content = buildGraphCsv(this.buildGraphModelForView());
@@ -562,6 +728,36 @@ class UsageComponent {
 	}
 
 	render(width: number): string[] {
+		this.lastWidth = width;
+		const rows = this.getRows();
+		const key = [
+			width,
+			rows,
+			this.viewMode,
+			this.activeTab,
+			this.dailyMetric,
+			this.dailyGroupBy,
+			this.dailyTopN,
+			this.cacheChart,
+			this.cacheGroupBy,
+			this.bucketCursor,
+			this.exportNote?.text ?? "",
+		].join("|");
+		if (this.viewMode === "daily" || this.viewMode === "cache") {
+			if (this.renderCache?.key === key) return this.renderCache.lines;
+			const budget = Math.max(rows - FRAME_ROWS, 20);
+			const body =
+				this.viewMode === "daily"
+					? renderDailyView(this.theme, this.data, this.dailyState(), width, budget, this.memo)
+					: renderCacheView(this.theme, this.data, this.cacheState(), width, budget, this.memo, this.rates());
+			const lines = clampLines(
+				[...this.renderTitle(width), ...this.renderTabs(width, getTableLayout(width)), ...body, ...this.renderHelp(width)],
+				width
+			);
+			this.renderCache = { key, lines };
+			return lines;
+		}
+
 		if (this.viewMode === "graph") {
 			return clampLines(
 				[...this.renderTitle(width), ...this.renderTabs(width, getTableLayout(width)), ...this.renderGraph(width), ...this.renderHelp(width)],
@@ -788,13 +984,13 @@ class UsageComponent {
 	private renderHeader(layout: TableLayout): string[] {
 		const th = this.theme;
 
-		let headerLine = fitCell("Provider / Model", layout.nameWidth);
+		const parts = [fitCell("Provider / Model", layout.nameWidth)];
 		for (const col of layout.columns) {
 			const label = fitCell(col.label, col.width, "right");
-			headerLine += col.dimmed ? th.fg("dim", label) : label;
+			parts.push(col.dimmed ? th.fg("dim", label) : label);
 		}
 
-		return [th.fg("muted", headerLine), th.fg("border", "─".repeat(layout.tableWidth))];
+		return [th.fg("muted", parts.join(" ".repeat(layout.gap))), th.fg("border", "─".repeat(layout.tableWidth))];
 	}
 
 	private renderDataRow(
@@ -813,15 +1009,15 @@ class UsageComponent {
 		const truncName = innerNameWidth > 0 ? truncateToWidth(name, innerNameWidth) : "";
 		const styledName = selected ? th.fg("accent", truncName) : dimAll ? th.fg("dim", truncName) : truncName;
 
-		let row = safePrefix + (innerNameWidth > 0 ? padRight(styledName, innerNameWidth) : "");
+		const parts = [safePrefix + (innerNameWidth > 0 ? padRight(styledName, innerNameWidth) : "")];
 
 		for (const col of layout.columns) {
 			const value = fitCell(col.getValue(stats), col.width, "right");
 			const shouldDim = col.dimmed || dimAll;
-			row += shouldDim ? th.fg("dim", value) : value;
+			parts.push(shouldDim ? th.fg("dim", value) : value);
 		}
 
-		return row;
+		return parts.join(" ".repeat(layout.gap));
 	}
 
 	private renderRows(layout: TableLayout): string[] {
@@ -857,7 +1053,8 @@ class UsageComponent {
 				const models = Array.from(providerStats.models.entries()).sort((a, b) => b[1].cost - a[1].cost);
 
 				for (const [modelName, modelStats] of models) {
-					lines.push(this.renderDataRow(modelName, modelStats, layout, { indent: 4, dimAll: true }));
+					const free = modelStats.cost === 0 && hasRecordedTokens(modelStats);
+					lines.push(this.renderDataRow(free ? `${modelName} (free)` : modelName, modelStats, layout, { indent: 4, dimAll: true }));
 				}
 			}
 		}
@@ -869,23 +1066,28 @@ class UsageComponent {
 		const th = this.theme;
 		const { totals } = this.visibleTable();
 
-		let totalRow = fitCell(th.bold("Total"), layout.nameWidth);
+		const parts = [fitCell(th.bold("Total"), layout.nameWidth)];
 		for (const col of layout.columns) {
 			const value = fitCell(col.getValue(totals), col.width, "right");
-			totalRow += col.dimmed ? th.fg("dim", value) : value;
+			parts.push(col.dimmed ? th.fg("dim", value) : value);
 		}
 
-		return [th.fg("border", "─".repeat(layout.tableWidth)), totalRow, ""];
+		return [th.fg("border", "─".repeat(layout.tableWidth)), parts.join(" ".repeat(layout.gap)), ""];
 	}
 
 	private renderFormulaNote(width: number): string[] {
-		const line = pickFittingText(width, [
+		const hitNote = pickFittingText(width, [
+			"Hit% = CacheRead / (Input + CacheWrite + CacheRead)",
+			"Hit% = cached input / all prompt input",
+			"Hit% = cached / prompt",
+		]);
+		const tokenNote = pickFittingText(width, [
 			"Tokens = Input + Output + CacheWrite  ·  ↑In = Input + CacheWrite  (as of 0.2.0)",
 			"Tokens = In + Out + CacheWrite  ·  ↑In = In + CacheWrite  (v0.2.0+)",
 			"Tokens & ↑In include CacheWrite (v0.2.0+)",
 			"Incl. CacheWrite (v0.2.0+)",
 		]);
-		return [this.theme.fg("dim", line), ""];
+		return [this.theme.fg("dim", hitNote), this.theme.fg("dim", tokenNote), ""];
 	}
 
 	private renderHelp(width: number): string[] {
@@ -893,7 +1095,21 @@ class UsageComponent {
 			? [this.theme.fg(this.exportNote.ok ? "success" : "error", `${this.exportNote.ok ? "✓" : "✗"} ${this.exportNote.text}`), ""]
 			: [];
 		const variants =
-			this.viewMode === "graph"
+			this.viewMode === "daily"
+				? [
+						"[Tab] period  [←→] day  [t] today  [m] metric  [g] group  [+/-] top N  [e] export  [v] view  [q] close",
+						"[Tab] period  [←→] day  [m] metric  [g] group  [+/-] top N  [v] view  [q] close",
+						"[Tab] [←→] [m] [g] [+/-] [v] [q]",
+						"[q] close",
+				  ]
+				: this.viewMode === "cache"
+				? [
+						"[Tab] period  [←→] day  [t] today  [m] chart  [g] provider/model  [e] export  [v] view  [q] close",
+						"[Tab] period  [←→] day  [m] chart  [g] group  [v] view  [q] close",
+						"[Tab] [←→] [m] [g] [v] [q]",
+						"[q] close",
+				  ]
+				: this.viewMode === "graph"
 				? [
 						"[Tab/←→] period  [m] metric  [g] group  [c] cumulative  [↑↓/Enter] filter  [a] all  [e] export  [v] view  [q] close",
 						"[Tab] period  [m] metric  [g] group  [c] cumul  [↑↓/Enter] filter  [e] export  [v] view  [q] close",
@@ -920,13 +1136,137 @@ class UsageComponent {
 		return [...noteLines, this.theme.fg("dim", line)];
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		this.renderCache = null;
+	}
+
+	/**
+	 * Swap in fresher data while open. View, tab, metric, grouping, top-N, cursor, filters, hidden
+	 * series and expanded rows are kept; indices are clamped to the new data; every model derived from
+	 * the old data (memo, input rates, render cache) is dropped.
+	 */
+	setData(data: UsageData): void {
+		this.data = data;
+		this.memoStore.clear();
+		this.inputRates = null;
+		this.renderCache = null;
+		this.updateProviderOrder(); // also clamps selectedIndex
+		const plan = planFor(this.memo, this.data, this.activeTab, this.lastWidth);
+		if (this.bucketCursor !== null) {
+			this.bucketCursor = plan.buckets.length === 0 ? null : Math.min(this.bucketCursor, plan.buckets.length - 1);
+		}
+		this.graphLegendIndex = Math.max(0, this.graphLegendIndex);
+		this.requestRender();
+	}
+
 	dispose(): void {}
 }
 
 // =============================================================================
 // Extension Entry Point
 // =============================================================================
+
+/** One component for the whole /usage session: loader (only if the snapshot is slow) → dashboard. */
+class UsageSession {
+	surfaceData: () => ReturnType<UsageFlow["surface"]>;
+	private loader: CancellableLoader | null = null;
+	private message = INITIAL_LOADING_MESSAGE;
+	private dashboard: { usage: UsageComponent; container: Container; theme: Theme } | null = null;
+	private flow: UsageFlow;
+	private ended = false;
+
+	constructor(
+		private readonly tui: { requestRender(): void; terminal: { rows: number } },
+		private readonly theme: Theme,
+		private readonly done: () => void,
+		sources: ResolvedUsageSources | undefined
+	) {
+		this.flow = createUsageFlow({
+			index: getUsageIndex({ sources }),
+			callbacks: {
+				showLoading: (message) => {
+					this.message = message;
+					if (this.dashboard || this.ended) return;
+					this.loader = new CancellableLoader(
+						tui as never,
+						(s: string) => theme.fg("accent", s),
+						(s: string) => theme.fg("muted", s),
+						message
+					);
+					this.loader.onAbort = () => this.close();
+					tui.requestRender();
+				},
+				setLoadingMessage: (message) => {
+					this.message = message;
+					this.loader?.setMessage(message);
+				},
+				showDashboard: (data) => {
+					this.loader?.dispose();
+					this.loader = null;
+					const container = new Container();
+					container.addChild(new Spacer(1));
+					container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
+					container.addChild(new Spacer(1));
+					const usage = new UsageComponent(
+						theme,
+						data,
+						() => tui.requestRender(),
+						() => this.close(),
+						() => tui.terminal.rows || 40
+					);
+					this.dashboard = { usage, container, theme };
+					tui.requestRender();
+				},
+				updateDashboard: (data) => this.dashboard?.usage.setData(data),
+				surfaceChanged: () => tui.requestRender(),
+				end: () => this.finish(),
+			},
+		});
+		this.surfaceData = () => this.flow.surface();
+		void this.flow.start();
+	}
+
+	private finish(): void {
+		if (this.ended) return;
+		this.ended = true;
+		this.loader?.dispose();
+		this.loader = null;
+		this.done();
+	}
+
+	private close(): void {
+		this.flow.close();
+		this.finish();
+	}
+
+	render(w: number): string[] {
+		if (this.dashboard) {
+			const { container, usage, theme } = this.dashboard;
+			const borderLines = clampLines(container.render(w), w);
+			const usageLines = usage.render(w);
+			const bottomBorder = theme.fg("border", "─".repeat(w));
+			return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
+		}
+		return this.loader ? this.loader.render(w) : [];
+	}
+
+	invalidate(): void {
+		this.dashboard?.container.invalidate();
+		this.dashboard?.usage.invalidate();
+		this.loader?.invalidate();
+	}
+
+	handleInput(input: string): void {
+		if (this.dashboard) this.dashboard.usage.handleInput(input);
+		else this.loader?.handleInput(input);
+	}
+
+	dispose(): void {
+		this.flow.close();
+		this.loader?.dispose();
+		this.loader = null;
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	pi.registerCommand("usage", {
@@ -936,69 +1276,14 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const data = await ctx.ui.custom<UsageData | null>((tui, theme, _kb, done) => {
-				const loader = new CancellableLoader(
-					tui,
-					(s: string) => theme.fg("accent", s),
-					(s: string) => theme.fg("muted", s),
-					"Loading Usage..."
-				);
-				let finished = false;
-				const finish = (value: UsageData | null) => {
-					if (finished) return;
-					finished = true;
-					loader.dispose();
-					done(value);
-				};
-
-				loader.onAbort = () => finish(null);
-
-				const onProgress = (p: CollectProgress): void => {
-					if (finished || p.filesToParse === 0) return;
-					const files = `${p.filesParsed.toLocaleString()}/${p.filesToParse.toLocaleString()} files`;
-					if (p.mode === "update") {
-						const since = p.sinceMs !== null ? ` since ${formatSinceDate(p.sinceMs)}` : "";
-						loader.setMessage(`Updating your usage history${since}… (${files})`);
-					} else if (p.mode === "rebuild") {
-						loader.setMessage(`Rebuilding your usage history — the cache format changed… (${files})`);
-					} else {
-						loader.setMessage(`Building your usage history for the first time… (${files})`);
-					}
-				};
-
-				collectUsageData({ signal: loader.signal, onProgress })
-					.then(finish)
-					.catch(() => finish(null));
-
-				return loader;
-			});
-
-			if (!data) {
-				return;
+			let sources: ResolvedUsageSources | undefined;
+			try {
+				sources = parseUsageSourcesSetting(readFileSync(join(getAgentDir(), "settings.json"), "utf8"));
+			} catch {
+				sources = undefined;
 			}
 
-			await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-				const container = new Container();
-
-				// Top border
-				container.addChild(new Spacer(1));
-				container.addChild(new DynamicBorder((s: string) => theme.fg("border", s)));
-				container.addChild(new Spacer(1));
-
-				const usage = new UsageComponent(theme, data, () => tui.requestRender(), () => done());
-
-				return {
-					render: (w: number) => {
-						const borderLines = clampLines(container.render(w), w);
-						const usageLines = usage.render(w);
-						const bottomBorder = theme.fg("border", "─".repeat(w));
-						return clampLines([...borderLines, ...usageLines, "", bottomBorder], w);
-					},
-					invalidate: () => container.invalidate(),
-					handleInput: (input: string) => usage.handleInput(input),
-					dispose: () => {},
-				};
-			});
+			await ctx.ui.custom<void>((tui, theme, _kb, done) => new UsageSession(tui, theme, () => done(), sources));
 		},
 	});
 }

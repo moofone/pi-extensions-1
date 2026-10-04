@@ -10,7 +10,7 @@
 // Explicit .ts extension so plain `node --test` (type stripping) can resolve
 // this module too; pi's extension loader accepts it as well.
 import type { HourlyCell, HourlyKey, PeriodBounds, TabName } from "./data.ts";
-import { splitHourlyKey } from "./data.ts";
+import { compareNamedSeries, splitHourlyKey } from "./data.ts";
 
 // =============================================================================
 // Options and model types
@@ -38,6 +38,15 @@ export const GROUP_LABELS: Record<GraphGroupBy, string> = {
 
 /** Series beyond this cap are merged into a single "other" series. */
 export const MAX_GROUP_SERIES = 6;
+
+const FIRST_CLASS_PROVIDERS = new Set(["opencode-go"]);
+const FIRST_CLASS_MODEL_PREFIXES = ["muse-spark-"];
+
+function isFirstClassGroup(groupBy: GraphGroupBy, key: string): boolean {
+	if (groupBy === "provider") return FIRST_CLASS_PROVIDERS.has(key);
+	if (groupBy === "model") return FIRST_CLASS_MODEL_PREFIXES.some((prefix) => key.startsWith(prefix));
+	return false;
+}
 
 export const TOTAL_SERIES_KEY = "\u0000total";
 export const OTHER_SERIES_KEY = "\u0000other";
@@ -75,6 +84,8 @@ export interface GraphModel {
 	domainEndMs: number;
 	/** Max point value across visible series (y-axis scale). */
 	yMax: number;
+	/** Bottom of the y-axis; 0 when omitted. Used by auto-ranged percent charts. */
+	yMin?: number;
 	/** Sum of totals across grouped (non-total) series, for legend percentages. */
 	groupedTotal: number;
 }
@@ -91,7 +102,9 @@ const MAX_HOURLY_BUCKETS = 8 * 24;
 function metricOf(cell: HourlyCell, metric: GraphMetric): number {
 	switch (metric) {
 		case "cost":
-			return cell.cost;
+			// List-priced value of tokens used. Identical to recorded cost for
+			// paid models; free-tier swe-2 charts its would-be cost.
+			return cell.estCost;
 		case "tokens":
 			// Matches the dashboard formula: fresh tokens = input + output + cacheWrite.
 			return cell.input + cell.output + cell.cacheWrite;
@@ -134,6 +147,7 @@ function domainFor(period: TabName, bounds: PeriodBounds, hourly: Map<number, Ma
  *
  * Buckets are hourly for short periods and daily for long ones. Group series
  * are capped at MAX_GROUP_SERIES by period total; the rest merge into "other".
+ * First-class extra sources (opencode-go / muse-spark-*) always keep their own series.
  * A Total series is always present (first). Hidden series keep their points
  * but are excluded from the y-axis scale.
  */
@@ -180,9 +194,15 @@ export function buildGraphModel(
 	}
 
 	// Rank groups and cap at MAX_GROUP_SERIES; merge the tail into "other".
+	// First-class keys stay their own series even when they rank below the cap.
 	const ranked = Array.from(groupTotals.entries()).sort((a, b) => b[1] - a[1]);
-	const kept = ranked.slice(0, MAX_GROUP_SERIES);
-	const merged = ranked.slice(MAX_GROUP_SERIES);
+	const rest = ranked.filter(([key]) => !isFirstClassGroup(options.groupBy, key));
+	const keptKeys = new Set([
+		...ranked.filter(([key]) => isFirstClassGroup(options.groupBy, key)).map(([key]) => key),
+		...rest.slice(0, MAX_GROUP_SERIES).map(([key]) => key),
+	]);
+	const kept = ranked.filter(([key]) => keptKeys.has(key)).sort((a, b) => compareNamedSeries(a[0], a[1], b[0], b[1]));
+	const merged = ranked.filter(([key]) => !keptKeys.has(key));
 
 	const hidden = options.hidden ?? new Set<string>();
 	const series: GraphSeries[] = [];
@@ -298,13 +318,14 @@ const DOT_BITS = [
  */
 export function renderChart(model: GraphModel, options: ChartRenderOptions): string[] {
 	const colorize: ChartColorize = options.colorize ?? ((_i, text) => text);
+	const yMin = model.yMin ?? 0;
 	const plotHeightForLabels = Math.max(options.height, 4);
 	const midRowForLabels = Math.floor((plotHeightForLabels - 1) / 2);
-	const midValue = (model.yMax * (plotHeightForLabels - 1 - midRowForLabels)) / (plotHeightForLabels - 1);
+	const midValue = yMin + ((model.yMax - yMin) * (plotHeightForLabels - 1 - midRowForLabels)) / (plotHeightForLabels - 1);
 	const yLabelWidth = Math.max(
 		options.formatValue(model.yMax).length,
 		options.formatValue(midValue).length,
-		options.formatValue(0).length
+		options.formatValue(yMin).length
 	);
 	const axisWidth = yLabelWidth + 2; // label + " ┤" / " │"
 	const plotWidth = Math.max(options.width - axisWidth, 10);
@@ -316,7 +337,7 @@ export function renderChart(model: GraphModel, options: ChartRenderOptions): str
 	const cellMasks: number[][] = Array.from({ length: plotHeight }, () => new Array<number>(plotWidth).fill(0));
 	const cellOwner: number[][] = Array.from({ length: plotHeight }, () => new Array<number>(plotWidth).fill(-1));
 
-	const yMax = model.yMax > 0 ? model.yMax : 1;
+	const yRange = model.yMax - yMin > 0 ? model.yMax - yMin : 1;
 	const bucketCount = model.bucketStarts.length;
 
 	const plot = (seriesIndex: number, points: number[], firstIdx: number, lastIdx: number) => {
@@ -324,8 +345,16 @@ export function renderChart(model: GraphModel, options: ChartRenderOptions): str
 		let prevX = -1;
 		let prevY = -1;
 		for (let i = firstIdx; i <= lastIdx; i++) {
+			const value = points[i]!;
+			if (!Number.isFinite(value)) {
+				// Gap (e.g. no prompt input that bucket): break the line.
+				prevX = -1;
+				prevY = -1;
+				continue;
+			}
 			const x = bucketCount === 1 ? dotW - 1 : Math.round((i / (bucketCount - 1)) * (dotW - 1));
-			const y = Math.round((1 - (points[i]! / yMax)) * (dotH - 1));
+			const clamped = Math.min(Math.max(value, yMin), model.yMax);
+			const y = Math.round((1 - (clamped - yMin) / yRange) * (dotH - 1));
 			if (prevX >= 0) {
 				// Connect with a vertical-stepped segment for continuity.
 				const steps = Math.max(Math.abs(x - prevX), Math.abs(y - prevY), 1);
@@ -369,7 +398,7 @@ export function renderChart(model: GraphModel, options: ChartRenderOptions): str
 		let label = "";
 		if (row === 0) label = options.formatValue(model.yMax);
 		else if (row === midRow && plotHeight > 2) label = options.formatValue(midValue);
-		else if (row === plotHeight - 1) label = options.formatValue(0);
+		else if (row === plotHeight - 1) label = options.formatValue(yMin);
 		const axisChar = label ? "┤" : "│";
 		let line = colorize(-1, label.padStart(yLabelWidth) + " " + axisChar);
 		// Batch consecutive cells with the same owning series into one colorize

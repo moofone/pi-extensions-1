@@ -1,12 +1,24 @@
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { homedir } from "node:os";
 
-import { collectUsageData, loadUsageCache, parseSessionBuffer, projectLabelFromCwd, saveUsageCache } from "../usage-extension/data.ts";
+import { cacheHitPercent, collectUsageData, collectUsageDataLegacy, formatCacheHitPercent, loadUsageCache, parseSessionBuffer, projectLabelFromCwd, saveUsageCache } from "../usage-extension/data.ts";
+
+test("cacheHitPercent counts reads, not writes, against all prompt input", () => {
+	assert.equal(cacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 800 }), 80);
+	assert.equal(cacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 0 }), 0);
+	assert.equal(cacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 100 }), 100);
+	assert.equal(cacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 0 }), undefined);
+	assert.equal(formatCacheHitPercent({ input: 100, cacheWrite: 100, cacheRead: 800 }), "80.0%");
+	assert.equal(formatCacheHitPercent({ input: 100, cacheWrite: 0, cacheRead: 0 }), "0.0%");
+	assert.equal(formatCacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 0 }), "-");
+	assert.equal(formatCacheHitPercent({ input: 0, cacheWrite: 0, cacheRead: 100 }), "100%");
+	assert.equal(formatCacheHitPercent({ input: 1, cacheWrite: 0, cacheRead: 9999 }), "99.9%");
+});
 
 // 2026-07-15 is a Wednesday. Week = Mon 13th 00:00 → …, last week = Mon 6th → Sun 12th.
 const NOW = new Date(2026, 6, 15, 12, 0, 0);
@@ -177,7 +189,12 @@ test("parseSessionBuffer extracts session id and assistant messages from compact
 		cacheWrite: 40,
 		reasoning: 0,
 		timestamp: TS_TODAY,
-		afterContextChange: false,
+		afterCompaction: false,
+		costInput: 0,
+		costOutput: 0,
+		costCacheRead: 0,
+		costCacheWrite: 0,
+		cacheWrite1h: 0,
 	});
 	assert.equal(parsed.cwd, "/tmp");
 });
@@ -207,7 +224,7 @@ test("parseSessionBuffer extracts Pi 0.81 tool and summary usage without consumi
 	assert.equal(parsed.toolUsages[0].reportedUsage.cost, 2);
 	assert.equal(parsed.toolUsages[0].reportedUsage.reasoning, 1);
 	assert.equal(parsed.toolUsages[0].timestamp, TS_TODAY + 1000);
-	assert.equal(parsed.messages[3].afterContextChange, true, "auxiliary entries must not clear the pending context change");
+	assert.equal(parsed.messages[3].afterCompaction, true, "auxiliary entries must not clear the pending context change");
 });
 
 test("parseSessionBuffer flags the first assistant message after compact and spaced context changes", async () => {
@@ -228,7 +245,7 @@ test("parseSessionBuffer flags the first assistant message after compact and spa
 
 	const parsed = await parseSessionBuffer(Buffer.from(content, "utf8"));
 	assert.deepEqual(
-		parsed.messages.map((message) => message.afterContextChange),
+		parsed.messages.map((message) => message.afterCompaction),
 		[false, true, false, true, true, false, true],
 	);
 });
@@ -382,6 +399,31 @@ test("collectUsageData aggregates periods, providers, and dedupes branched histo
 	assert.equal(anthropic.models.get("claude-fable-5").messages, 2);
 	assert.equal(openai.messages, 1);
 	assert.equal(openai.cost, 4);
+});
+
+test("collectUsageData prices zero-cost paid Devin DeepSeek without charging free SWE-2", async (t) => {
+	const { sessionsDir, cachePath } = fixture(t);
+	writeFileSync(
+		join(sessionsDir, "devin.jsonl"),
+		[
+			sessionLine("devin-paid", TS_TODAY),
+			assistantLine({ ts: TS_TODAY, provider: "devin", model: "deepseek-v4.1-flash", cost: 0, input: 1_000_000, cacheRead: 1_000_000, output: 1_000_000 }),
+			assistantLine({ ts: TS_TODAY + 1000, provider: "devin", model: "swe-2", cost: 0, input: 1_000_000, output: 1_000_000 }),
+			assistantLine({ ts: TS_TODAY + 2000, provider: "devin", model: "deepseek-v4.1-flash", cost: 3, input: 1_000_000, output: 1_000_000 }),
+			assistantLine({ ts: TS_TODAY + 3000, provider: "other", model: "deepseek-v4.1-flash", cost: 0, input: 1_000_000, output: 1_000_000 }),
+		].join("\n") + "\n"
+	);
+	for (let pass = 0; pass < 2; pass++) {
+		const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+		assert.ok(data);
+		const devin = data.today.providers.get("devin");
+		assert.ok(devin);
+		assert.ok(Math.abs(devin.models.get("deepseek-v4.1-flash").cost - 3.89) < 1e-9);
+		assert.equal(devin.models.get("swe-2").cost, 0);
+		assert.ok(Math.abs(data.today.totals.cost - 3.89) < 1e-9);
+		const hour = data.hourly.get(Math.floor(TS_TODAY / 3_600_000) * 3_600_000);
+		assert.ok(Math.abs(hour.get("devin\u0000deepseek-v4.1-flash\u0000").cost - 3.89) < 1e-9);
+	}
 });
 
 test("collectUsageData includes tool and summary usage without inflating assistant message counts", async (t) => {
@@ -682,7 +724,7 @@ test("collectUsageData returns null when aborted", async (t) => {
 // collectUsageData — caching
 // =============================================================================
 
-test("collectUsageData reuses the cache for unchanged files and invalidates on change", async (t) => {
+test("collectUsageDataLegacy reuses the cache for unchanged files and invalidates on change", async (t) => {
 	const { sessionsDir, cachePath } = fixture(t);
 	const filePath = join(sessionsDir, "a.jsonl");
 	writeFileSync(
@@ -690,7 +732,7 @@ test("collectUsageData reuses the cache for unchanged files and invalidates on c
 		[sessionLine("s1", TS_TODAY), assistantLine({ ts: TS_TODAY, cost: 1 })].join("\n") + "\n"
 	);
 
-	const first = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const first = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(first.allTime.totals.cost, 1);
 	assert.ok(existsSync(cachePath));
 
@@ -700,12 +742,12 @@ test("collectUsageData reuses the cache for unchanged files and invalidates on c
 	cacheJson.files[filePath].messages[0][2] = 999;
 	writeFileSync(cachePath, JSON.stringify(cacheJson));
 
-	const second = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const second = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(second.allTime.totals.cost, 999, "unchanged file should be served from cache");
 
 	// Appending to the file changes its size → cache entry invalidated → reparse.
 	appendFileSync(filePath, assistantLine({ ts: TS_TODAY + 60_000, cost: 2 }) + "\n");
-	const third = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const third = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(third.allTime.totals.cost, 3, "changed file should be reparsed from disk");
 	assert.equal(third.allTime.totals.messages, 2);
 
@@ -714,7 +756,7 @@ test("collectUsageData reuses the cache for unchanged files and invalidates on c
 	assert.equal(refreshed.files[filePath].messages[0][2], 1);
 });
 
-test("collectUsageData evicts cache entries for deleted files", async (t) => {
+test("collectUsageDataLegacy evicts cache entries for deleted files", async (t) => {
 	const { sessionsDir, cachePath } = fixture(t);
 	const keepPath = join(sessionsDir, "keep.jsonl");
 	const dropPath = join(sessionsDir, "drop.jsonl");
@@ -724,16 +766,27 @@ test("collectUsageData evicts cache entries for deleted files", async (t) => {
 		[sessionLine("s2", TS_TODAY), assistantLine({ ts: TS_TODAY + 1000, cost: 10 })].join("\n") + "\n"
 	);
 
-	const first = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const first = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(first.allTime.totals.cost, 11);
 
 	rmSync(dropPath);
-	const second = await collectUsageData({ sessionsDir, cachePath, now: NOW });
+	const second = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
 	assert.equal(second.allTime.totals.cost, 1);
 
 	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
 	assert.ok(cacheJson.files[keepPath]);
 	assert.equal(cacheJson.files[dropPath], undefined);
+});
+
+test("collectUsageData drops deleted files from its incremental index", async (t) => {
+	const { sessionsDir, cachePath } = fixture(t);
+	const keepPath = join(sessionsDir, "keep.jsonl");
+	const dropPath = join(sessionsDir, "drop.jsonl");
+	writeFileSync(keepPath, [sessionLine("s1", TS_TODAY), assistantLine({ ts: TS_TODAY, cost: 1 })].join("\n") + "\n");
+	writeFileSync(dropPath, [sessionLine("s2", TS_TODAY), assistantLine({ ts: TS_TODAY + 1000, cost: 10 })].join("\n") + "\n");
+	assert.equal((await collectUsageData({ sessionsDir, cachePath, now: NOW })).allTime.totals.cost, 11);
+	rmSync(dropPath);
+	assert.equal((await collectUsageData({ sessionsDir, cachePath, now: NOW })).allTime.totals.cost, 1);
 });
 
 test("collectUsageData survives a corrupt cache file", async (t) => {
@@ -747,9 +800,10 @@ test("collectUsageData survives a corrupt cache file", async (t) => {
 	const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
 	assert.equal(data.allTime.totals.cost, 1);
 
-	// Cache was rebuilt.
-	const cacheJson = JSON.parse(readFileSync(cachePath, "utf8"));
-	assert.equal(cacheJson.version, 6);
+	// The unusable legacy cache is ignored and a fresh one is rebuilt by the legacy collector.
+	const legacy = await collectUsageDataLegacy({ sessionsDir, cachePath, now: NOW });
+	assert.equal(legacy.allTime.totals.cost, 1);
+	assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).version, 7);
 });
 
 test("collectUsageData works with the cache disabled", async (t) => {
@@ -780,8 +834,8 @@ test("saveUsageCache/loadUsageCache round-trips file states", async (t) => {
 					sessionId: "s1",
 					cwd: "/home/u/projects/x",
 					messages: [
-						{ provider: "anthropic", model: "claude-fable-5", thinkingLevel: "xhigh", source: "assistant", sourceId: "", cost: 1.5, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 7, timestamp: TS_TODAY, afterContextChange: true },
-						{ provider: "Tools", model: "summaries", thinkingLevel: "Tools/summaries", source: "auxiliary", sourceId: "summary-a", cost: 0.25, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, reasoning: 0, timestamp: TS_OLD, afterContextChange: false },
+						{ provider: "anthropic", model: "claude-fable-5", thinkingLevel: "xhigh", source: "assistant", sourceId: "", cost: 1.5, input: 10, output: 20, cacheRead: 30, cacheWrite: 40, reasoning: 7, timestamp: TS_TODAY, afterCompaction: true, costInput: 0.1, costOutput: 0.5, costCacheRead: 0.2, costCacheWrite: 0.7, cacheWrite1h: 40 },
+						{ provider: "Tools", model: "summaries", thinkingLevel: "Tools/summaries", source: "auxiliary", sourceId: "summary-a", cost: 0.25, input: 1, output: 2, cacheRead: 3, cacheWrite: 4, reasoning: 0, timestamp: TS_OLD, afterCompaction: false, costInput: 0, costOutput: 0, costCacheRead: 0, costCacheWrite: 0, cacheWrite1h: 0 },
 					],
 					toolUsages: [
 						{
@@ -859,24 +913,28 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
 	writeFileSync(cachePath, JSON.stringify({ version: 4, names: [], files: {} }));
 	assert.equal((await loadUsageCache(cachePath)).size, 0);
 
-	// v5 caches predate intentional context-edit boundaries.
+	// v5 caches predate extra-source estimated USD.
 	writeFileSync(cachePath, JSON.stringify({ version: 5, names: [], files: {} }));
+	assert.equal((await loadUsageCache(cachePath)).size, 0);
+
+	// v6 caches predate the per-class cost split and 1h cache writes.
+	writeFileSync(cachePath, JSON.stringify({ version: 6, names: [], files: {} }));
 	assert.equal((await loadUsageCache(cachePath)).size, 0);
 
 	writeFileSync(
 		cachePath,
 		JSON.stringify({
-			version: 6,
+			version: 7,
 			names: ["p", "m", "high", "entry-a"],
 			files: {
-				"/ok.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3]], toolUsages: [] },
+				"/ok.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 5, 1, 1, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
 				"/bad-tuple.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1]], toolUsages: [] },
-				"/bad-name-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[7, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]], toolUsages: [] },
-				"/bad-level-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 9, 0, 0, 0, 3]], toolUsages: [] },
-				"/bad-source.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 7, 3]], toolUsages: [] },
-				"/bad-source-id.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 9]], toolUsages: [] },
+				"/bad-name-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[7, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
+				"/bad-level-idx.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 9, 0, 0, 0, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
+				"/bad-source.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 7, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
+				"/bad-source-id.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 9, 0, 0, 0, 0, 0]], toolUsages: [] },
 				"/bad-tool.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [], toolUsages: [[3, TS_TODAY, [1, 2], 3, []]] },
-				"/no-cwd.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3]], toolUsages: [] },
+				"/no-cwd.jsonl": { size: 1, mtimeMs: 2, sessionId: "s", messages: [[0, 1, 1, 1, 1, 0, 0, TS_TODAY, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0]], toolUsages: [] },
 				"/bad-shape.jsonl": { size: "x", mtimeMs: 2, sessionId: "s", cwd: "/w", messages: [], toolUsages: [] },
 			},
 		})
@@ -885,7 +943,7 @@ test("loadUsageCache rejects wrong versions and malformed entries", async (t) =>
 	assert.deepEqual([...loaded.keys()], ["/ok.jsonl"]);
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].thinkingLevel, "high");
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].reasoning, 5);
-	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].afterContextChange, true);
+	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].afterCompaction, true);
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].source, "auxiliary");
 	assert.equal(loaded.get("/ok.jsonl").parsed.messages[0].sourceId, "entry-a");
 	assert.equal(loaded.get("/ok.jsonl").parsed.cwd, "/w");
@@ -963,7 +1021,8 @@ test("pi test providers are excluded from all stats", async (t) => {
 		[
 			sessionLine("s1", TS_TODAY),
 			assistantLine({ ts: TS_TODAY, cost: 2 }),
-			assistantLine({ ts: TS_TODAY + 1000, cost: 99, provider: "faux-provider", model: "faux" }),
+			assistantLine({ ts: TS_TODAY + 1000, cost: 99, provider: "faux", model: "faux-1" }),
+			assistantLine({ ts: TS_TODAY + 1500, cost: 99, provider: "faux-provider", model: "faux" }),
 			assistantLine({ ts: TS_TODAY + 2000, cost: 99, provider: "fake-provider", model: "fake" }),
 		].join("\n") + "\n"
 	);
@@ -971,6 +1030,7 @@ test("pi test providers are excluded from all stats", async (t) => {
 	const data = await collectUsageData({ sessionsDir, cachePath, now: NOW });
 	assert.equal(data.today.totals.cost, 2, "test-provider cost is excluded");
 	assert.equal(data.today.totals.messages, 1, "test-provider messages are excluded");
+	assert.ok(!data.today.providers.has("faux"), "the real faux provider id is excluded");
 	assert.ok(!data.today.providers.has("faux-provider"));
 	assert.ok(!data.today.providers.has("fake-provider"));
 });
@@ -1092,7 +1152,7 @@ test("collectUsageData reports first-run, update, and rebuild progress modes", a
 		join(sessionsDir, "b.jsonl"),
 		[sessionLine("s2", TS_TODAY), assistantLine({ ts: TS_TODAY + 1000, cost: 2 })].join("\n") + "\n"
 	);
-	const cachedMtimes = Object.values(JSON.parse(readFileSync(cachePath, "utf8")).files).map((f) => f.mtimeMs);
+	const cachedMtimes = [statSync(join(sessionsDir, "a.jsonl")).mtimeMs];
 	events = [];
 	await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => events.push(p) });
 	assert.equal(events[0].mode, "update");
@@ -1101,9 +1161,10 @@ test("collectUsageData reports first-run, update, and rebuild progress modes", a
 	assert.equal(events.at(-1).filesParsed, 1);
 
 	// Rebuild: cache file exists but is unusable (e.g. an older format version).
-	writeFileSync(cachePath, JSON.stringify({ version: 1, names: [], files: {} }));
+	const staleCachePath = join(dirname(cachePath), "stale-cache.json");
+	writeFileSync(staleCachePath, JSON.stringify({ version: 1, names: [], files: {} }));
 	events = [];
-	await collectUsageData({ sessionsDir, cachePath, now: NOW, onProgress: (p) => events.push(p) });
+	await collectUsageData({ sessionsDir, cachePath: staleCachePath, now: NOW, onProgress: (p) => events.push(p) });
 	assert.equal(events[0].mode, "rebuild");
 	assert.equal(events[0].filesToParse, 2);
 	assert.equal(events[0].sinceMs, null);

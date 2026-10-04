@@ -24,8 +24,9 @@ const BOUNDS = {
 	nowMs: NOW,
 };
 
-function cell({ messages = 1, cost = 0, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, reasoning = 0 } = {}) {
-	return { messages, cost, input, output, cacheRead, cacheWrite, reasoning };
+function cell({ messages = 1, cost = 0, estCost, input = 0, output = 0, cacheRead = 0, cacheWrite = 0, reasoning = 0 } = {}) {
+	// estCost defaults to cost, matching paid-usage semantics.
+	return { messages, cost, estCost: estCost ?? cost, input, output, cacheRead, cacheWrite, reasoning };
 }
 
 function hourlyFrom(entries) {
@@ -155,6 +156,43 @@ test("buildGraphModel caps series and merges the tail into other", () => {
 	// Sum of all group series equals the total series.
 	const groupSum = model.series.slice(1).reduce((sum, s) => sum + s.total, 0);
 	assert.equal(groupSum, model.series[0].total);
+});
+
+test("buildGraphModel keeps opencode-go and muse-spark first-class instead of folding into other", () => {
+	const entries = [];
+	for (let i = 0; i < MAX_GROUP_SERIES - 1; i++) {
+		entries.push([TODAY + HOUR, `prov${i}`, "m", "", cell({ cost: 100 - i })]);
+	}
+	entries.push([TODAY + HOUR, "Tools", "summaries", "", cell({ cost: 50 })]);
+	entries.push([TODAY + HOUR, "opencode-go", "muse-spark-1.3-contributor", "", cell({ cost: 3 })]);
+	entries.push([TODAY + HOUR, "tiny", "m", "", cell({ cost: 1 })]);
+
+	const byProvider = buildGraphModel(hourlyFrom(entries), {
+		period: "today",
+		metric: "cost",
+		groupBy: "provider",
+		cumulative: false,
+		bounds: BOUNDS,
+	});
+	const providerLabels = byProvider.series.map((s) => s.label);
+	assert.ok(providerLabels.includes("opencode-go"));
+	assert.equal(byProvider.series.find((s) => s.key === "opencode-go").hidden, false);
+	const goIdx = providerLabels.indexOf("opencode-go");
+	const toolsIdx = providerLabels.indexOf("Tools");
+	assert.ok(goIdx > 0 && toolsIdx > goIdx, "opencode-go must sit above Tools");
+	const other = byProvider.series.find((s) => s.key === OTHER_SERIES_KEY);
+	assert.equal(other.label, "other (1)");
+	assert.equal(other.total, 1);
+
+	const byModel = buildGraphModel(hourlyFrom(entries), {
+		period: "today",
+		metric: "cost",
+		groupBy: "model",
+		cumulative: false,
+		bounds: BOUNDS,
+	});
+	assert.ok(byModel.series.some((s) => s.label === "muse-spark-1.3-contributor"));
+	assert.equal(byModel.series.find((s) => s.label === "muse-spark-1.3-contributor").hidden, false);
 });
 
 test("buildGraphModel respects hidden series for y-scale but keeps their points", () => {

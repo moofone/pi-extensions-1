@@ -95,14 +95,14 @@ The **Insights** view has two sections, facts first:
 
 | Alarm | Fires when |
 |---|---|
-| Resuming after a break | ≥ 2% of the period's cost (and ≥ $1) went to messages that re-sent a large conversation from scratch after a > 5 min idle gap — provider caches expire after a few minutes idle |
+| Resuming after a break | ≥ 2% of the period's cost (and ≥ $1) went to messages that re-sent a large conversation from scratch after a > 5 min gap. The gap is timing only — it is not proof the provider cache expired |
 | Switching models mid-conversation | ≥ 2% of cost (and ≥ $1) went to large-context misses right after the provider/model changed mid-session — the previous model's cache doesn't transfer |
 | Mid-session re-sends (prefix change) | ≥ 2% of cost (and ≥ $1) went to large-context misses with **no** idle gap, compaction, context edit, or model switch to explain them — something unexpectedly rewrote the request prefix |
 | Session concentration | the top 5 sessions account for ≥ 35% of the period's cost |
 | Upfront tax | ≥ 8% of cost was the first message of a session (session starts pay for their whole prompt uncached) |
 | Cache leverage floor | fewer than 5 cached tokens served per fresh token paid (shown only above $5 / 1M fresh tokens, to avoid noise) |
 
-pi's built-in test providers (`faux-provider`, `fake-provider`) never call a real API and are excluded from all statistics, graphs, and insights.
+pi's built-in test providers (`faux`, `faux-provider`, `fake-provider`) never call a real API and are excluded from all statistics, graphs, and insights.
 
 **Unit:** insights are weighted by recorded API cost (USD). Periods with no recorded cost show an explicit empty state rather than silently switching to a different unit.
 
@@ -168,7 +168,10 @@ Time periods are calculated in the local timezone where Pi runs. If you want to 
 | **Tokens** | Fresh tokens for the turn: input + output + cache write |
 | **↑In** | Fresh input tokens: input + cache write *(dimmed)* |
 | **↓Out** | Output tokens *(dimmed)* |
-| **Cache** | Cache read + write tokens *(dimmed; informational)* |
+| **Cache** | Cache read + write tokens *(dimmed; informational; hidden before Hit% on narrower terminals)* |
+| **Hit%** | Share of prompt input served from cache: `cacheRead / (input + cacheWrite + cacheRead)`; `-` when no prompt input was reported |
+
+`Hit%` uses provider-reported token buckets, not the `Cache` column or output tokens. Cache writes are **misses**, not hits. The rate is aggregated from token totals across the selected period (not an average of per-message rates). Auxiliary Pi `cache_warm` usage entries are not currently ingested by this dashboard, so refresh costs are not part of these table totals.
 
 > **As of 0.2.0:** `Tokens = Input + Output + CacheWrite` and `↑In = Input + CacheWrite`. `CacheRead` stays out of `Tokens` so repeated cache hits don't swamp the dashboard. The dashboard itself shows a one-line footer reminder.
 
@@ -193,9 +196,10 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 
 ## Performance & Caching
 
-`/usage` builds its stats from every session JSONL file under `<agentDir>/sessions`. To keep opens fast on large histories (multi-GB, thousands of files):
+`/usage` builds its stats from every session JSONL file under `<agentDir>/sessions`, plus any extra stores you opt into (see [Extra sources](#extra-sources)). Disabled extra sources are not walked. To keep opens fast on large histories (multi-GB, thousands of files):
 
 - **On-disk cache.** Per-file extraction results are cached in `<agentDir>/usage-extension-cache.json` (respects `PI_CODING_AGENT_DIR`), keyed by file size + mtime. Warm opens only re-parse session files that changed since the last run — on a 5.2 GB / 3,310-file corpus that takes the open from ~17 s to ~0.3 s.
+- **Instant open, live while open.** `/usage` first paints the last persisted rollup (native clients show it immediately with a "refreshing" state), then replaces it with a fresh snapshot of the usage index. In the terminal the loader only appears when the snapshot takes longer than ~150 ms. While the dashboard is open it follows background changes (new turns in active sessions) in place, keeping the view, period, metric, grouping, filters, cursor and expanded rows.
 - **First open** after install (or after deleting the cache) does a one-off full build, showing the usual cancellable loader. Cancelling saves partial progress, so the next open resumes where it left off.
 - The cache is safe to delete at any time; it is rebuilt automatically. Corrupt or version-mismatched caches are ignored and rebuilt rather than trusted.
 - **0.9.3 bumps the cache format to v5** to retain child-session linkage for tool-usage reconciliation (v4 added Pi 0.81.0 tool and summary usage; v3 added session working directory and compaction markers; v2 added thinking level and reasoning tokens). The first open after upgrading does a one-off full rebuild (with a progress message and live file counter), then warm opens are fast again.
@@ -205,7 +209,7 @@ On narrow terminals, `/usage` automatically switches to a compact table instead 
 
 ### Cost Tracking
 
-Cost data comes directly from persisted usage values. For assistant messages it is grouped by provider/model. Pi 0.81.0+ can also persist usage reported by tools, compaction, and branch summarization; because those entries do not carry reliable provider/model attribution, `/usage` groups them under `Tools / summaries`, matching Pi's `/session` breakdown. Recognised legacy `subagent` and `subagent_wait` details are used as a fallback when their child session is no longer available. Accuracy depends on the provider or tool reporting costs.
+Cost data usually comes directly from persisted usage values. Devin's `deepseek-v4.1-flash` can persist $0 despite being a paid model: `/usage` estimates its missing cost from Devin's catalog ($0.22/M fresh input, $0.01/M cached input, $0.66/M output). This is a token-based estimate, not an invoice; reported nonzero costs take precedence, and free Devin `swe-2` remains $0. Assistant messages are grouped by provider/model. Pi 0.81.0+ can also persist usage reported by tools, compaction, and branch summarization; because those entries do not carry reliable provider/model attribution, `/usage` groups them under `Tools / summaries`, matching Pi's `/session` breakdown. Recognised legacy `subagent` and `subagent_wait` details are used as a fallback when their child session is no longer available. Accuracy depends on the provider or tool reporting costs.
 
 Only persisted usage can be counted. Pi did not add usage metadata retroactively, so historical compaction or branch-summary entries written without `usage` remain unmetered: their exact token and cost vectors cannot be reconstructed. The compatibility audit corpus contained 2,753 such compactions and 20 branch summaries.
 
@@ -219,7 +223,7 @@ Cache token support varies by provider:
 | Google | ✓ | ✗ |
 | OpenAI Codex | ✓ | ✗ |
 
-The "Cache" column combines both read and write tokens.
+The "Cache" column combines both read and write tokens; `Hit%` separates reads from writes and divides reads by all prompt input.
 
 `Tokens` and `↑In` include cache writes but intentionally exclude cache reads. That keeps totals aligned with fresh/billed prompt work without letting repeated cache hits swamp the dashboard.
 
@@ -231,6 +235,50 @@ Assistant messages duplicated across branched session files are deduplicated by 
 
 Respects the `PI_CODING_AGENT_DIR` environment variable if set.
 
+## Extra sources
+
+Off by default. When enabled, `/usage` folds other local agent logs into the same provider/model buckets as Pi:
+
+| Setting | Default roots | Folded as |
+| --- | --- | --- |
+| `claudeCode` | `~/.claude/projects`, `~/.config/claude/projects` (`CLAUDE_CONFIG_DIR` if set) | `anthropic` |
+| `codexCli` | `~/.codex/sessions` (`CODEX_HOME` if set) | `openai-codex` |
+| `grokBuild` | `~/.grok/sessions` (`GROK_HOME` if set); only `updates.jsonl` | `xai` (Pi `grok-build` too) |
+| `opencodeGo` (alias `opencode`) | `~/.local/share/opencode` (`OPENCODE_DATA_DIR` / `XDG_DATA_HOME`); only `storage/message/msg_*.json` | `opencode-go` (Pi `opencode` too); GLM still folds into `zai` |
+
+```json
+{
+  "usage-extension": {
+    "sources": {
+      "claudeCode": true,
+      "codexCli": true,
+      "grokBuild": true,
+      "opencodeGo": true
+    }
+  }
+}
+```
+
+Override a root with `{ "enabled": true, "path": "~/other" }` or `paths: ["...", "..."]`. Run `/reload` after editing settings.
+
+Mapping notes (correctness):
+
+- Claude Code `input_tokens` is uncached; cache create/read are separate fields.
+- Codex CLI and Grok Build include cache reads in input; `/usage` splits them so `↑In` stays fresh tokens.
+- Codex `turn_token_usage` / `thread_token_usage` are ignored (cumulatives). Only each `token_usage_record.usage` is counted.
+- Grok only counts `sessionUpdate: "turn_completed"`. Cost uses `costUsdTicks` (1e-10 USD). In-progress turns are omitted.
+- Model ids are kept as recorded (`grok-4.6` vs `grok-4.6-build` stay distinct rows).
+- Claude Code / Codex CLI usually have no invoice. `/usage` fills catalog USD (Pi's per-million rates) so cost graphs/tables include them. Grok `costUsdTicks` still wins when present.
+- Extra-source cost estimates rebuild the on-disk cache once (v6).
+- OpenCode Go: `muse-spark-1.3-contributor` uses the Pi catalog ($0.10 / $0.20 / $0.002 per M). `*-contributor-free` stays $0. GLM via `zai-coding-plan` folds into `zai`. `storage/part` is never scanned.
+- Graph: `opencode-go` and `muse-spark-*` are first-class series (never folded into `other`, never hidden by default). Extra sources themselves stay **off** until `usage-extension.sources.*` is true.
+
+The first open after enabling a source parses those files once, then the same size+mtime cache applies.
+
 ## Changelog
 
 See `CHANGELOG.md`.
+
+## Native clients (pi-hud)
+
+Both `ctx.ui.custom()` components used by `/usage` carry a `surfaceData()` function returning a JSON payload for native hosts (the TUI ignores it): `{ kind: "pi-hud/usage", v: 1, loading: { message } }` while loading, then `{ kind, v, rollup }` where `rollup` is a sparse daily × (provider, model) table (`days`, `keys`, `reporting`, `fields`, `rows`). Built by `buildUsageRollup` in `native.ts`; the same object reference is returned until the content changes.
