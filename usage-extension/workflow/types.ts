@@ -5,7 +5,7 @@ export const WORKFLOW_METRICS = [
   "duplicateDeliveries", "duplicateBytes", "abortedNoFinal", "abortedConversations",
   "testCalls", "pairedTestCalls", "testExitKnown", "testExitZero", "testErrored",
   "testTimeouts", "testFiltered", "testForcedExit", "mutations", "nonTestNamedMutations",
-  "firstTestAfterMutation", "baselineReads", "startupConversations", "startupSystemBytes",
+  "firstTestAfterMutation", "baselineReads", "startupConversations", "startupUnavailable", "startupSystemBytes",
   "startupTaskBytes", "assistantRecords", "tokenComplete", "costComplete", "reasoningComplete",
   "compactions", "compactionPairs", "beforePrompt", "afterPrompt", "opaqueRecords",
 ] as const;
@@ -41,6 +41,9 @@ export interface WorkflowRecord {
   textHash?: string;
   deliveryHash?: string;
   deliveryBytes?: number;
+  /** A second literal source slice when the runtime footer can follow a trimmed report newline. */
+  deliveryAlternateHash?: string;
+  deliveryAlternateBytes?: number;
   wakeHash?: string;
   providerError?: boolean;
   calls?: WorkflowCall[];

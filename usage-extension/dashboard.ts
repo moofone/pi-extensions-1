@@ -9,7 +9,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 import type { PeriodBounds, TabName, UsageData } from "./data.ts";
-import { AUXILIARY_PROVIDER } from "./data.ts";
+import { AUXILIARY_PROVIDER, workflowInsightsFor } from "./data.ts";
 import type { Bucket, BucketPlan, BucketUnit, StackGroupBy, StackMetric, StackModel } from "./bars.ts";
 import {
 	PAINT_AXIS,
@@ -716,6 +716,55 @@ export function renderCacheView(
 			lines.push(swatch(rowColors[i]!, "■") + " " + fit(row.label, nameW) + columns.map((c) => " " + fit(c.value(row.totals), c.width, "right")).join(""));
 		}
 		if (model.rows.length > rowsShown) lines.push(th.fg("dim", `  … ${model.rows.length - rowsShown} more (widen/heighten the terminal or export with [e])`));
+		lines.push("");
+	}
+	return lines;
+}
+
+// =============================================================================
+// Workflow observations (deterministic, code generated; observations, not verdicts)
+// =============================================================================
+
+function wrapPlain(text: string, width: number): string[] {
+	const out: string[] = [];
+	let line = "";
+	for (const word of text.split(/\s+/)) {
+		if (!word) continue;
+		if (line && line.length + 1 + word.length > width) {
+			out.push(line);
+			line = word;
+		} else line = line ? `${line} ${word}` : word;
+	}
+	if (line) out.push(line);
+	return out;
+}
+
+/** The nine workflow lenses for the selected period. Absent workflow data is shown as unavailable, never as healthy. */
+export function renderWorkflowInsights(th: Theme, data: UsageData, period: TabName, width: number): string[] {
+	const contentWidth = Math.max(Math.min(width, 100), 40);
+	const lines: string[] = [th.bold("Workflow observations")];
+	for (const wrapped of wrapPlain("Deterministic counts from captured local Pi session records. Observations overlap and are not verdicts, a partition of cost, or advice.", contentWidth)) {
+		lines.push(th.fg("dim", wrapped));
+	}
+	lines.push("");
+	if (!data.workflow) {
+		lines.push(th.fg("dim", "  Workflow evidence is unavailable (not captured by this usage source)."));
+		lines.push("");
+		return lines;
+	}
+	const insights = workflowInsightsFor(data, period);
+	if (insights.length === 0) {
+		lines.push(th.fg("dim", "  No captured workflow records in this period."));
+		lines.push("");
+		return lines;
+	}
+	for (const insight of insights) {
+		lines.push(`  ${insight.headline}`);
+		for (const wrapped of wrapPlain(insight.detail, contentWidth - 4)) lines.push(`    ${th.fg("dim", wrapped)}`);
+		if (insight.evidence.length > 0) {
+			const refs = insight.evidence.slice(0, 3).map((e) => `${e.session}:${e.line}${e.relatedLine !== undefined ? `→${e.relatedLine}` : ""}`);
+			lines.push(`    ${th.fg("dim", `Evidence: ${refs.join(", ")}`)}`);
+		}
 		lines.push("");
 	}
 	return lines;

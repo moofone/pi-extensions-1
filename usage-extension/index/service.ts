@@ -14,6 +14,8 @@ import { lstat, readdir, stat } from "node:fs/promises";
 import { basename, join, sep } from "node:path";
 import { getAgentDir } from "../data.ts";
 import type { UsageData } from "../data.ts";
+import { buildWorkflowSnapshot } from "../workflow/analyze.ts";
+import type { WorkflowSnapshot } from "../workflow/types.ts";
 import { buildUsageRollup } from "../native.ts";
 import { disabledUsageSources } from "../sources.ts";
 import type { ResolvedUsageSources, UsageFileKind } from "../sources.ts";
@@ -21,10 +23,11 @@ import { ContributionTracker } from "./contrib.ts";
 import * as discoverModule from "./discover.ts";
 import { UsageLedger } from "./ledger.ts";
 import { ParsePool } from "./pool.ts";
-import { applyParseDelta, parseFile } from "./parse.ts";
+import { applyParseDelta, parseFile, resumeOf } from "./parse.ts";
 import { openIndexStore } from "./store.ts";
 import type { OpenStoreOptions } from "./store.ts";
 import { UsageWatcher, WATCH_DEBOUNCE_MS, WATCH_SWEEP_MS } from "./watch.ts";
+import { compareCanonical } from "./types.ts";
 import type { DiscoveredFile, FileRecord, IndexStore, ParseOutcome, SnapshotOptions, UsageIndexOptions } from "./types.ts";
 
 /** Batches of at least this many changed files go to the parse pool. */
@@ -67,6 +70,9 @@ export interface RefreshResult {
 	/** Records were added, changed or removed. */
 	changed: boolean;
 }
+
+/** A Pi record cached before workflow capture existed (or whose capture was rejected on load): reparse it once. */
+const lacksWorkflowCapture = (record: FileRecord): boolean => record.kind === "pi" && !record.parsed.workflow;
 
 type DiscoverFn = (options: { sessionsDir: string; sources: ResolvedUsageSources; signal?: AbortSignal }) => Promise<DiscoveredFile[] | null>;
 
@@ -129,6 +135,9 @@ export class UsageIndexCore {
 	private tracker = new ContributionTracker();
 	private ledger = new UsageLedger();
 	private loaded = false;
+	/** Aggregated workflow evidence, rebuilt only after a capture changed (not on every unchanged paint). */
+	private workflowCache: WorkflowSnapshot | null = null;
+	private workflowStale = true;
 	private legacyExisted = false;
 	private chain: Promise<unknown> = Promise.resolve();
 	private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -265,7 +274,7 @@ export class UsageIndexCore {
 			for (const f of files) {
 				present.add(f.path);
 				const r = this.records.get(f.path);
-				if (!r || r.size !== f.size || r.mtimeMs !== f.mtimeMs) changedFiles.push(f);
+				if (!r || r.size !== f.size || r.mtimeMs !== f.mtimeMs || lacksWorkflowCapture(r)) changedFiles.push(f);
 			}
 			const removed: string[] = [];
 			for (const p of this.records.keys()) if (!present.has(p)) removed.push(p);
@@ -297,7 +306,7 @@ export class UsageIndexCore {
 							if (known) removed.push(path);
 							return;
 						}
-						if (!known || known.size !== st.size || known.mtimeMs !== st.mtimeMs) changedFiles.push({ path, kind: known?.kind ?? kind!, size: st.size, mtimeMs: st.mtimeMs });
+						if (!known || known.size !== st.size || known.mtimeMs !== st.mtimeMs || lacksWorkflowCapture(known)) changedFiles.push({ path, kind: known?.kind ?? kind!, size: st.size, mtimeMs: st.mtimeMs });
 					} catch (error) {
 						if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR") {
 							if (known) removed.push(path);
@@ -344,6 +353,7 @@ export class UsageIndexCore {
 			this.earlyDiscovery = this.discover(signal);
 			this.earlyDiscovery.catch(() => {});
 			this.records = await this.store.load();
+			this.workflowStale = true;
 			if (signal?.aborted) this.earlyDiscovery = null;
 			this.loaded = true;
 			if (signal?.aborted) {
@@ -437,6 +447,7 @@ export class UsageIndexCore {
 		// Records order for the tracker: unchanged first, then freshly parsed (canonical sorting is its job).
 		const allUpserts = unchanged.length > 0 ? [...unchanged, ...upserts] : upserts;
 		const changed = upserts.length > 0 || gone.length > 0;
+		if (gone.length > 0 || upserts.some((u) => u.change.type !== "none")) this.workflowStale = true;
 		if (allUpserts.length > 0 || gone.length > 0) this.ledger.apply(this.tracker.update({ upserts: allUpserts, removed: gone }));
 		if (changed) this.scheduleFlush();
 		return { ok: !aborted, changed };
@@ -448,7 +459,7 @@ export class UsageIndexCore {
 
 	private async parseOne(file: DiscoveredFile, previous: FileRecord | undefined, pool: ParsePool | null, signal?: AbortSignal): Promise<ParseOutcome | null> {
 		if (pool) {
-			const result = await pool.parse(file, previous?.resume ?? null, signal);
+			const result = await pool.parse(file, resumeOf(previous), signal);
 			if (result !== "failed") return result ? applyParseDelta(file, previous, result) : null;
 			if (signal?.aborted) return null;
 		}
@@ -479,9 +490,20 @@ export class UsageIndexCore {
 			const result = await this.refreshNow(options, true);
 			if (!result.ok) return null;
 			const data = this.ledger.snapshot(now);
+			data.workflow = this.workflowSnapshot();
 			if (this.internal.persistRollup && this.storeDir) void this.store.writeRollup(buildUsageRollup(data, { now: options.now })).catch(() => {});
 			return data;
 		});
+	}
+
+	/** Workflow evidence over every known file in canonical order; files without a capture count as unavailable. */
+	private workflowSnapshot(): WorkflowSnapshot {
+		if (this.workflowStale || !this.workflowCache) {
+			const files = [...this.records.values()].sort(compareCanonical);
+			this.workflowCache = buildWorkflowSnapshot(files.map((r) => ({ sessionId: r.parsed.sessionId, capture: r.parsed.workflow })));
+			this.workflowStale = false;
+		}
+		return this.workflowCache;
 	}
 
 	lastRollup(): Promise<unknown | null> {

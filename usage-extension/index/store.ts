@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { loadUsageCache } from "../data.ts";
 import type { ChildToolUsage, SessionMessage, ToolUsageRecord, UsageAmount } from "../data.ts";
 import type { UsageFileKind } from "../sources.ts";
+import type { WorkflowCapture } from "../workflow/types.ts";
 import { KIND_ORDER } from "./types.ts";
 import type { FileRecord, IndexStore, ResumeState } from "./types.ts";
 
@@ -64,7 +65,26 @@ type UsageTuple = [number, number, number, number, number, number];
 type MessageTuple = number[];
 type ChildTuple = [number, number, UsageTuple];
 type ToolTuple = [number, number, UsageTuple | null, number, ChildTuple[]];
-type FileTuple = [string, number, number, string, number, [number, string, string, Record<string, unknown>] | null, MessageTuple[], ToolTuple[]];
+/** Optional 9th element: the workflow capture (hashes and scalars only). Shards written before it have 8. */
+type FileTuple = [string, number, number, string, number, [number, string, string, Record<string, unknown>] | null, MessageTuple[], ToolTuple[]] | [string, number, number, string, number, [number, string, string, Record<string, unknown>] | null, MessageTuple[], ToolTuple[], WorkflowCapture];
+
+const WORKFLOW_KINDS = new Set(["session", "metadata", "context-edit", "system", "user", "notice", "assistant", "tool-result", "compaction", "opaque"]);
+const WORKFLOW_PERSIST_CAP = 30_000;
+
+/** A persisted capture is trusted only when structurally sound; anything else is dropped (the file then counts as
+ * "no capture" and a Pi file is reparsed), never repaired or presented as complete. */
+function decodeWorkflow(value: unknown): WorkflowCapture | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const { version, records, omittedRecords } = value as Record<string, unknown>;
+	if (version !== 1 || !Array.isArray(records) || records.length > WORKFLOW_PERSIST_CAP) return undefined;
+	if (typeof omittedRecords !== "number" || !Number.isSafeInteger(omittedRecords) || omittedRecords < 0) return undefined;
+	for (const item of records) {
+		if (!item || typeof item !== "object") return undefined;
+		const r = item as Record<string, unknown>;
+		if (typeof r.id !== "string" || !Number.isSafeInteger(r.line) || (r.line as number) < 1 || typeof r.kind !== "string" || !WORKFLOW_KINDS.has(r.kind)) return undefined;
+	}
+	return value as WorkflowCapture;
+}
 
 interface ShardFile {
 	version: number;
@@ -134,12 +154,13 @@ function encodeRecord(record: FileRecord, names: Interner): FileTuple {
 		]
 	);
 	const resume = record.resume ? ([record.resume.offset, record.resume.headHash, record.resume.tailHash, record.resume.state] as [number, string, string, Record<string, unknown>]) : null;
-	return [record.kind, record.size, record.mtimeMs, record.parsed.sessionId, names.intern(record.parsed.cwd), resume, messages, toolUsages];
+	const base: FileTuple = [record.kind, record.size, record.mtimeMs, record.parsed.sessionId, names.intern(record.parsed.cwd), resume, messages, toolUsages];
+	return record.parsed.workflow ? [...base, record.parsed.workflow] as FileTuple : base;
 }
 
 function decodeRecord(path: string, tuple: unknown, names: string[]): FileRecord | null {
-	if (!Array.isArray(tuple) || tuple.length !== 8) return null;
-	const [kind, size, mtimeMs, sessionId, cwdIdx, resumeRaw, messageTuples, toolTuples] = tuple as unknown[];
+	if (!Array.isArray(tuple) || (tuple.length !== 8 && tuple.length !== 9)) return null;
+	const [kind, size, mtimeMs, sessionId, cwdIdx, resumeRaw, messageTuples, toolTuples, workflowRaw] = tuple as unknown[];
 	if (typeof kind !== "string" || !KIND_ORDER.includes(kind as UsageFileKind)) return null;
 	const cwd = names[cwdIdx as number];
 	if (typeof size !== "number" || typeof mtimeMs !== "number" || typeof sessionId !== "string" || typeof cwd !== "string") return null;
@@ -203,7 +224,8 @@ function decodeRecord(path: string, tuple: unknown, names: string[]): FileRecord
 		toolUsages.push({ sourceId, timestamp: Number(raw[1]) || 0, reportedUsage, runId, children });
 	}
 
-	return { path, kind: kind as UsageFileKind, size, mtimeMs, resume, parsed: { sessionId, cwd, messages, toolUsages } };
+	const workflow = tuple.length === 9 ? decodeWorkflow(workflowRaw) : undefined;
+	return { path, kind: kind as UsageFileKind, size, mtimeMs, resume, parsed: { sessionId, cwd, messages, toolUsages, ...(workflow ? { workflow } : {}) } };
 }
 
 function shardName(n: number): string {

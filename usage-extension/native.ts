@@ -11,6 +11,7 @@
 import { buildInputRates } from "./cache.ts";
 import { splitHourlyKey } from "./data.ts";
 import type { UsageData } from "./data.ts";
+import type { WorkflowSnapshot } from "./workflow/types.ts";
 
 export const USAGE_NATIVE_KIND = "pi-hud/usage";
 export const USAGE_NATIVE_VERSION = 1;
@@ -66,6 +67,8 @@ export interface UsageRollup {
 	rows: number[][];
 	/** Insight inputs per day (optional, additive to v1; absent on the legacy collection path). */
 	insights?: UsageRollupInsights;
+	/** Deterministic workflow evidence (optional, additive to v1). Absent means unavailable, never healthy. */
+	workflow?: WorkflowSnapshot;
 }
 
 /** Field names of `UsageRollupInsights.dayRows[2...]`... see INSIGHT_DAY_FIELDS. */
@@ -131,6 +134,12 @@ export function buildUsageRollup(data: UsageData, options: { now?: Date } = {}):
 	// Contiguous local days: first bucket's day .. today.
 	let firstMs = Infinity;
 	for (const hour of data.hourly.keys()) if (hour < firstMs) firstMs = hour;
+	// Workflow-only observations can precede the first accounting bucket (including zero-usage errors).
+	for (const row of data.workflow?.days ?? []) {
+		if (!/^\d{4}-\d{2}-\d{2}$/.test(row.day)) continue;
+		const d = new Date(`${row.day}T00:00:00`);
+		if (Number.isFinite(d.getTime()) && localDayKey(d) === row.day && d.getTime() < firstMs) firstMs = d.getTime();
+	}
 	const today = new Date(nowMs);
 	const start = new Date(Number.isFinite(firstMs) && firstMs < nowMs ? firstMs : nowMs);
 	const days: string[] = [];
@@ -223,6 +232,7 @@ export function buildUsageRollup(data: UsageData, options: { now?: Date } = {}):
 		rows,
 	};
 	if (data.insightDays) rollup.insights = buildInsights(data.insightDays, dayIndex);
+	if (data.workflow) rollup.workflow = data.workflow;
 	return { kind: USAGE_NATIVE_KIND, v: USAGE_NATIVE_VERSION, rollup };
 }
 

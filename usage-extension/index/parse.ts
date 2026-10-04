@@ -54,6 +54,12 @@ async function readWhole(handle: FileHandle, size: number): Promise<Buffer> {
 	return filled === size ? buffer : buffer.subarray(0, filled);
 }
 
+/** Pi resume states written before workflow capture lack the physical line counter: a tail parse could not
+ * number lines or know the retained count, so such a file must be reparsed in full (once). */
+function workflowResumable(kind: DiscoveredFile["kind"], state: Record<string, unknown>): boolean {
+	return kind !== "pi" || (Number.isSafeInteger(state.wfLines) && Number.isSafeInteger(state.wfKept));
+}
+
 function validResume(value: ResumeState | null): value is ResumeState {
 	return (
 		!!value &&
@@ -77,6 +83,7 @@ function deltaOf(file: DiscoveredFile, chunk: ChunkParseResult): ParsedSessionFi
 		cwd: typeof state.cwd === "string" ? state.cwd : "",
 		messages: chunk.messages,
 		toolUsages: chunk.toolUsages,
+		...(chunk.workflow ? { workflow: chunk.workflow } : {}),
 	};
 }
 
@@ -120,7 +127,7 @@ export async function parseFileDelta(file: DiscoveredFile, previous: ResumeState
 	}
 	try {
 		const size = (await handle.stat()).size;
-		if (validResume(previous) && size >= previous.offset) {
+		if (validResume(previous) && workflowResumable(file.kind, previous.state) && size >= previous.offset) {
 			const appended = await tryAppend(handle, file, previous, size, signal);
 			if (signal?.aborted) return null;
 			if (appended) return appended;
@@ -206,13 +213,26 @@ export function applyParseDelta(file: DiscoveredFile, previous: FileRecord | und
 		messages: [...previous.parsed.messages, ...result.delta.messages],
 		toolUsages: [...previous.parsed.toolUsages, ...result.delta.toolUsages],
 	};
+	const before = previous.parsed.workflow;
+	const added = result.delta.workflow;
+	// Both sides or neither: a capture is never presented as complete when one side is missing.
+	if (before && added) {
+		parsed.workflow = { version: 1, records: [...before.records, ...added.records], omittedRecords: before.omittedRecords + added.omittedRecords };
+	}
 	return {
 		record: { ...base, parsed },
 		change: { type: "append", messagesFrom: previous.parsed.messages.length, toolUsagesFrom: previous.parsed.toolUsages.length },
 	};
 }
 
+/** Resume point to hand to the parser: a Pi record without a workflow capture (pre-workflow cache) is never
+ * continued, so it is reparsed in full instead of leaving a stale or partial capture. */
+export function resumeOf(previous: FileRecord | undefined): ResumeState | null {
+	if (!previous?.resume) return null;
+	return previous.kind === "pi" && !previous.parsed.workflow ? null : previous.resume;
+}
+
 export const parseFile: ParseFile = async (file, previous, signal) => {
-	const result = await parseFileDelta(file, previous?.resume ?? null, signal);
+	const result = await parseFileDelta(file, resumeOf(previous), signal);
 	return result ? applyParseDelta(file, previous, result) : null;
 };
