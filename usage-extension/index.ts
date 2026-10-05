@@ -40,6 +40,7 @@ import {
 	planFor,
 	renderCacheView,
 	renderDailyView,
+	renderWorkflowInsights,
 	resolveCursor,
 } from "./dashboard";
 import type { Memo } from "./dashboard";
@@ -865,7 +866,12 @@ class UsageComponent {
 		return lines;
 	}
 
+	/** Cost insights plus the workflow observations, which do not depend on cost or usage being present. */
 	private renderInsights(width: number): string[] {
+		return [...this.renderCostInsights(width), ...renderWorkflowInsights(this.theme, this.data, this.activeTab, width)];
+	}
+
+	private renderCostInsights(width: number): string[] {
 		const th = this.theme;
 		const stats = this.data[this.activeTab];
 		const { insights } = stats.insights;

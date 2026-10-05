@@ -98,8 +98,9 @@ export function appendTurns(file, n, seed, startTs = Date.now() - 600_000) {
 
 export function normalizeUsageData(data) {
 	// insightDays is ledger-only (native clients); the legacy oracle has no equivalent
-	if (data && typeof data === "object" && "insightDays" in data) {
-		const { insightDays: _skip, ...rest } = data;
+	// workflow likewise: optional index-only evidence (the legacy path leaves it unavailable)
+	if (data && typeof data === "object" && ("insightDays" in data || "workflow" in data)) {
+		const { insightDays: _skip, workflow: _skipWorkflow, ...rest } = data;
 		data = rest;
 	}
 	const norm = (v) => {

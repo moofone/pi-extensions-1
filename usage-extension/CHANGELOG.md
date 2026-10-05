@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Workflow evidence (deterministic, no model, no waste verdicts): the usage index captures hashes and scalars from Pi JSONL in the existing scan (30,000 records per file cap, opaque markers for large tool results), exposes `UsageData.workflow` and an optional native `rollup.workflow`, and adds period insights helpers for the terminal. Pi files cached earlier are re-read once; other sources are reported unavailable. The Insights view renders the workflow section; opaque records are disclosed as global coverage.
 - `/usage` flow built on the usage index (`usage-flow.ts`): the persisted rollup is shown first (native payload carries `rollup` together with `loading`), the terminal loader appears only for snapshots slower than ~150 ms, and the open dashboard updates live (`UsageComponent.setData`) with view state preserved and a fresh native `surfaceData` object per update.
 - Native-client data path: `/usage` components now expose `surfaceData` (function) with a `pi-hud/usage` v1 payload — a loading message while collecting, then a daily × (provider, model) rollup (`native.ts`). The terminal UI is unchanged.
 - Table `Hit%` column shows the provider-reported cache-read share of prompt input, per provider/model and total; cache writes count as misses. On narrow terminals it takes priority over the informational cache-token volume.
@@ -22,6 +23,14 @@
 - Insights no longer say a pause of a few minutes expired the provider cache. A gap is recorded as timing, not as the cause of a re-send.
 - Totals row alignment: a Cost value exactly as wide as its column (e.g. `$10480 ($10000)`, 15 chars in a 15-wide column) left zero leading padding and fused with the messages count as `104,048$10480 ($10000)`. Right-alignment can never guarantee a gap, so cells are now joined with an explicit separator that is at least one space at any width.
 - The `Faux` test provider no longer appears in the table, graphs, totals, or insights. The exclusion list matched `faux-provider` and `fake-provider`, but pi records the real id as `faux` (the default in `providers/faux.ts`); `faux-provider` exists only as a fixture label in pi's own test suite, so the filter never matched anything on disk.
+
+## [0.9.5] - 2026-09-22
+
+### Changed
+- Treat Pi 0.87 `context_edit` entries as intentional request-prefix changes so they do not count as cache misses.
+
+### Internal
+- Cache format bumped to **v6**. The first `/usage` open after upgrading performs a one-off rebuild.
 
 ## [0.9.4] - 2026-07-22
 

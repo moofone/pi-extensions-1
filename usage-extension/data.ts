@@ -30,6 +30,9 @@ import {
 } from "./sources.ts";
 import type { ExtraSourceKind, ResolvedUsageSources, UsageFileKind } from "./sources.ts";
 import { compareCanonical } from "./index/types.ts";
+import { extractWorkflowRecord, opaqueWorkflowRecord } from "./workflow/extract.ts";
+import { workflowInsights } from "./workflow/analyze.ts";
+import type { WorkflowCapture, WorkflowInsight, WorkflowRecord, WorkflowSnapshot } from "./workflow/types.ts";
 
 // =============================================================================
 // Types
@@ -243,6 +246,8 @@ export interface UsageData {
 	bounds: PeriodBounds;
 	/** Per local day insight inputs for native clients (usage index only; absent on the legacy path). */
 	insightDays?: InsightDays;
+	/** Deterministic workflow evidence (usage index only). Absent = unavailable (legacy path, old payloads), never healthy. */
+	workflow?: WorkflowSnapshot;
 }
 
 /** Insight inputs per local calendar day ("YYYY-MM-DD"), so a native client can compute any window's insights. */
@@ -293,11 +298,8 @@ export interface SessionMessage extends UsageAmount {
 	/** Session entry id used to dedupe copied auxiliary entries; empty for assistant messages. */
 	sourceId: string;
 	timestamp: number;
-	/**
-	 * True when a compaction entry occurred between the previous assistant
-	 * message and this one. Compaction legitimately changes the request prefix,
-	 * so such messages are excluded from prefix-change cache-miss accounting.
-	 */
+	/** Historical field name: true after a compaction OR intentional context edit.
+	 * Both boundaries legitimately change the prefix and are excluded from miss accounting. */
 	afterCompaction: boolean;
 	/** Recorded per-class cost (Pi `usage.cost.*`); absent for sources without a breakdown. */
 	costInput?: number;
@@ -336,6 +338,8 @@ export interface ParsedSessionFile {
 	messages: SessionMessage[];
 	/** Tool usage is reconciled against recursively scanned child sessions later. */
 	toolUsages: ToolUsageRecord[];
+	/** Workflow evidence of Pi JSONL files (hashes and scalars only). Absent: unsupported source or pre-workflow cache. */
+	workflow?: WorkflowCapture;
 }
 
 // =============================================================================
@@ -382,6 +386,8 @@ const PATTERN_THINKING_COMPACT = Buffer.from('"type":"thinking_level_change"');
 const PATTERN_THINKING_SPACED = Buffer.from('"type": "thinking_level_change"');
 const PATTERN_COMPACTION_COMPACT = Buffer.from('"type":"compaction"');
 const PATTERN_COMPACTION_SPACED = Buffer.from('"type": "compaction"');
+const PATTERN_CONTEXT_EDIT_COMPACT = Buffer.from('"type":"context_edit"');
+const PATTERN_CONTEXT_EDIT_SPACED = Buffer.from('"type": "context_edit"');
 const PATTERN_BRANCH_SUMMARY_COMPACT = Buffer.from('"type":"branch_summary"');
 const PATTERN_BRANCH_SUMMARY_SPACED = Buffer.from('"type": "branch_summary"');
 // pi-subagents versions predating Pi 0.81 persisted child usage in details but
@@ -481,6 +487,8 @@ function buildToolUsageRecord(
 }
 
 const LARGE_TOOL_RESULT_BYTES = 64 * 1024;
+/** Workflow records retained per file; the rest are counted in `omittedRecords`. */
+export const WORKFLOW_RECORD_CAP = 30_000;
 const PROPERTY_ID = Buffer.from('"id":');
 const PROPERTY_TIMESTAMP = Buffer.from('"timestamp":');
 const PROPERTY_MESSAGE = Buffer.from('"message":');
@@ -724,10 +732,12 @@ function lineMightBeRelevant(line: Buffer): boolean {
 		head.includes(PATTERN_SESSION_COMPACT) ||
 		head.includes(PATTERN_THINKING_COMPACT) ||
 		head.includes(PATTERN_COMPACTION_COMPACT) ||
+		head.includes(PATTERN_CONTEXT_EDIT_COMPACT) ||
 		head.includes(PATTERN_BRANCH_SUMMARY_COMPACT) ||
 		head.includes(PATTERN_SESSION_SPACED) ||
 		head.includes(PATTERN_THINKING_SPACED) ||
 		head.includes(PATTERN_COMPACTION_SPACED) ||
+		head.includes(PATTERN_CONTEXT_EDIT_SPACED) ||
 		head.includes(PATTERN_BRANCH_SUMMARY_SPACED)
 	);
 }
@@ -742,6 +752,8 @@ export interface ChunkParseResult {
 	state: Record<string, unknown>;
 	/** True when this chunk changes the meaning of records parsed earlier (so the caller must parse from 0). */
 	reparse: boolean;
+	/** Workflow records of THIS chunk only (Pi JSONL; absent for other sources or a state without a line counter). */
+	workflow?: WorkflowCapture;
 }
 
 /**
@@ -764,6 +776,23 @@ export async function parseSessionChunk(
 	// to the level active when it was produced.
 	let thinkingLevel = typeof state?.thinkingLevel === "string" ? state.thinkingLevel : "";
 	let compactionPending = state?.compactionPending === true;
+	// Workflow capture rides the same scan. It needs the physical line counter (`wfLines`) and the retained
+	// count (`wfKept`) of an earlier chunk; a resume state without them cannot be continued correctly.
+	const wfOn = state === null || (Number.isSafeInteger(state.wfLines) && Number.isSafeInteger(state.wfKept));
+	let wfLine = wfOn && state ? (state.wfLines as number) : 0;
+	let wfKept = wfOn && state ? (state.wfKept as number) : 0;
+	/** The previous chunk consumed its last line without the trailing newline: that newline is not a new line. */
+	let wfContinuing = wfOn && state?.wfTail === true;
+	let wfTail = wfContinuing;
+	const wfRecords: WorkflowRecord[] = [];
+	let wfOmitted = 0;
+	const wfAdd = (record: WorkflowRecord | null): void => {
+		if (!record) return;
+		if (wfKept < WORKFLOW_RECORD_CAP) {
+			wfRecords.push(record);
+			wfKept++;
+		} else wfOmitted++;
+	};
 
 	let start = 0;
 	let consumed = 0;
@@ -773,8 +802,9 @@ export async function parseSessionChunk(
 		messages,
 		toolUsages,
 		consumed,
-		state: { sessionId, cwd, thinkingLevel, compactionPending },
+		state: wfOn ? { sessionId, cwd, thinkingLevel, compactionPending, wfLines: wfLine, wfKept, wfTail } : { sessionId, cwd, thinkingLevel, compactionPending },
 		reparse: false,
+		...(wfOn ? { workflow: { version: 1 as const, records: wfRecords, omittedRecords: wfOmitted } } : {}),
 	});
 
 	while (start < buffer.length) {
@@ -789,66 +819,94 @@ export async function parseSessionChunk(
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			if (signal?.aborted) return result();
 		}
+		// The first segment continues the previous chunk's unterminated last line: same physical line.
+		if (wfOn && !wfContinuing) wfLine++;
+		wfContinuing = false;
+		wfTail = end === buffer.length && buffer[buffer.length - 1] !== NEWLINE;
 
 		const lineBuffer = buffer.subarray(start, end);
-		if (end > start && lineMightBeRelevant(lineBuffer)) {
+		if (end > start) {
+			const relevant = lineMightBeRelevant(lineBuffer);
 			const head = lineBuffer.subarray(0, Math.min(1024, lineBuffer.length));
-			if (lineBuffer.length > LARGE_TOOL_RESULT_BYTES && head.includes(PATTERN_TOOL_RESULT_COMPACT)) {
-				const toolUsage = parseLargeToolResultLine(lineBuffer);
-				if (toolUsage) toolUsages.push(toolUsage);
-				start = end + 1;
-				consumed = Math.min(start, buffer.length);
-				continue;
-			}
-			try {
-				const entry = JSON.parse(buffer.toString("utf8", start, end));
-
-				if (entry.type === "session") {
-					sessionId = entry.id;
-					if (typeof entry.cwd === "string") cwd = entry.cwd;
-				} else if (entry.type === "thinking_level_change") {
-					if (typeof entry.thinkingLevel === "string") thinkingLevel = entry.thinkingLevel;
-				} else if (entry.type === "compaction") {
-					const usage = parseUsageAmount(entry.usage);
-					if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), typeof entry.id === "string" ? entry.id : ""));
-					compactionPending = true;
-				} else if (entry.type === "branch_summary") {
-					const usage = parseUsageAmount(entry.usage);
-					if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), typeof entry.id === "string" ? entry.id : ""));
-				} else if (entry.type === "message" && entry.message?.role === "assistant") {
-					const msg = entry.message;
-					if (msg.usage && msg.provider && msg.model) {
-						const fallbackTs = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
-						const costParts = msg.usage.cost && typeof msg.usage.cost === "object" ? msg.usage.cost : null;
-						messages.push({
-							provider: msg.provider,
-							model: msg.model,
-							thinkingLevel,
-							source: "assistant",
-							sourceId: "",
-							cost: msg.usage.cost?.total || 0,
-							input: msg.usage.input || 0,
-							output: msg.usage.output || 0,
-							cacheRead: msg.usage.cacheRead || 0,
-							cacheWrite: msg.usage.cacheWrite || 0,
-							reasoning: msg.usage.reasoning || 0,
-							timestamp: msg.timestamp || (Number.isNaN(fallbackTs) ? 0 : fallbackTs),
-							afterCompaction: compactionPending,
-							costInput: finiteNumber(costParts?.input),
-							costOutput: finiteNumber(costParts?.output),
-							costCacheRead: finiteNumber(costParts?.cacheRead),
-							costCacheWrite: finiteNumber(costParts?.cacheWrite),
-							cacheWrite1h: finiteNumber(msg.usage.cacheWrite1h),
-						});
-						compactionPending = false;
-					}
-				} else if (entry.type === "message" && entry.message?.role === "toolResult") {
-					const msg = entry.message;
-					const toolUsage = buildToolUsageRecord(msg.toolName, msg.details, msg.usage, entry.id, msg.timestamp, entry.timestamp);
+			const large = lineBuffer.length > LARGE_TOOL_RESULT_BYTES;
+			if (large && head.includes(PATTERN_TOOL_RESULT_COMPACT)) {
+				// Never decode a large tool result: accounting reads its small fields byte-wise; workflow marks it opaque.
+				if (relevant) {
+					const toolUsage = parseLargeToolResultLine(lineBuffer);
 					if (toolUsage) toolUsages.push(toolUsage);
 				}
-			} catch {
-				// Skip malformed lines
+				if (wfOn) wfAdd(opaqueWorkflowRecord(wfLine));
+			} else if (relevant || (wfOn && !large)) {
+				let entry: any;
+				let decoded = false;
+				try {
+					entry = JSON.parse(buffer.toString("utf8", start, end));
+					decoded = true;
+					if (!relevant) {
+						// Workflow-only line: no accounting meaning.
+					} else if (entry.type === "session") {
+						sessionId = entry.id;
+						if (typeof entry.cwd === "string") cwd = entry.cwd;
+					} else if (entry.type === "thinking_level_change") {
+						if (typeof entry.thinkingLevel === "string") thinkingLevel = entry.thinkingLevel;
+					} else if (entry.type === "compaction") {
+						const usage = parseUsageAmount(entry.usage);
+						if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), typeof entry.id === "string" ? entry.id : ""));
+						compactionPending = true;
+					} else if (entry.type === "context_edit") {
+						compactionPending = true;
+					} else if (entry.type === "branch_summary") {
+						const usage = parseUsageAmount(entry.usage);
+						if (usage) messages.push(auxiliaryMessage(usage, parsedTimestamp(undefined, entry.timestamp), typeof entry.id === "string" ? entry.id : ""));
+					} else if (entry.type === "message" && entry.message?.role === "assistant") {
+						const msg = entry.message;
+						if (msg.usage && msg.provider && msg.model) {
+							const fallbackTs = entry.timestamp ? new Date(entry.timestamp).getTime() : 0;
+							const costParts = msg.usage.cost && typeof msg.usage.cost === "object" ? msg.usage.cost : null;
+							messages.push({
+								provider: msg.provider,
+								model: msg.model,
+								thinkingLevel,
+								source: "assistant",
+								sourceId: "",
+								cost: msg.usage.cost?.total || 0,
+								input: msg.usage.input || 0,
+								output: msg.usage.output || 0,
+								cacheRead: msg.usage.cacheRead || 0,
+								cacheWrite: msg.usage.cacheWrite || 0,
+								reasoning: msg.usage.reasoning || 0,
+								timestamp: msg.timestamp || (Number.isNaN(fallbackTs) ? 0 : fallbackTs),
+								afterCompaction: compactionPending,
+								costInput: finiteNumber(costParts?.input),
+								costOutput: finiteNumber(costParts?.output),
+								costCacheRead: finiteNumber(costParts?.cacheRead),
+								costCacheWrite: finiteNumber(costParts?.cacheWrite),
+								cacheWrite1h: finiteNumber(msg.usage.cacheWrite1h),
+							});
+							compactionPending = false;
+						}
+					} else if (entry.type === "message" && entry.message?.role === "toolResult") {
+						const msg = entry.message;
+						const toolUsage = buildToolUsageRecord(msg.toolName, msg.details, msg.usage, entry.id, msg.timestamp, entry.timestamp);
+						if (toolUsage) toolUsages.push(toolUsage);
+					}
+				} catch {
+					// Skip malformed lines
+				}
+				if (wfOn) {
+					if (!decoded) wfAdd(opaqueWorkflowRecord(wfLine));
+					else {
+						let record: WorkflowRecord | null;
+						try {
+							record = extractWorkflowRecord(entry, wfLine);
+						} catch {
+							record = opaqueWorkflowRecord(wfLine);
+						}
+						wfAdd(record);
+					}
+				}
+			} else if (wfOn) {
+				wfAdd(opaqueWorkflowRecord(wfLine)); // large non-accounting line: never decoded
 			}
 		}
 
@@ -866,7 +924,13 @@ export async function parseSessionChunk(
  */
 export async function parseSessionBuffer(buffer: Buffer, signal?: AbortSignal): Promise<ParsedSessionFile> {
 	const chunk = await parseSessionChunk(buffer, null, false, signal);
-	return { sessionId: chunk.state.sessionId as string, cwd: chunk.state.cwd as string, messages: chunk.messages, toolUsages: chunk.toolUsages };
+	return {
+		sessionId: chunk.state.sessionId as string,
+		cwd: chunk.state.cwd as string,
+		messages: chunk.messages,
+		toolUsages: chunk.toolUsages,
+		...(chunk.workflow ? { workflow: chunk.workflow } : {}),
+	};
 }
 
 // =============================================================================
@@ -2162,4 +2226,45 @@ function formatThresholdTokens(n: number): string {
 	if (n >= 1_000_000) return `${n / 1_000_000}M`;
 	if (n >= 1_000) return `${n / 1_000}k`;
 	return String(n);
+}
+
+// =============================================================================
+// Workflow insights by period (code generated; no model, no advice)
+// =============================================================================
+
+const localDay = (ms: number): string => {
+	const d = new Date(ms);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+
+/** Local-day window of a period, matching the usage period bounds (`allTime` is unbounded). */
+export function workflowPeriodDays(bounds: PeriodBounds, period: TabName): { startDay: string | undefined; endDay: string | undefined } {
+	switch (period) {
+		case "today":
+			return { startDay: localDay(bounds.todayMs), endDay: localDay(bounds.nowMs) };
+		case "thisWeek":
+			return { startDay: localDay(bounds.weekStartMs), endDay: localDay(bounds.nowMs) };
+		case "lastWeek":
+			return { startDay: localDay(bounds.lastWeekStartMs), endDay: localDay(bounds.weekStartMs - 1) };
+		case "last30Days":
+			return { startDay: localDay(bounds.last30DaysStartMs), endDay: localDay(bounds.nowMs) };
+		case "allTime":
+			return { startDay: undefined, endDay: undefined };
+	}
+}
+
+const workflowInsightMemo = new WeakMap<WorkflowSnapshot, Map<string, WorkflowInsight[]>>();
+
+/** Nine-lens insights for the selected period, memoized per snapshot object. [] when workflow data is unavailable. */
+export function workflowInsightsFor(data: UsageData, period: TabName): WorkflowInsight[] {
+	const snapshot = data.workflow;
+	if (!snapshot) return [];
+	const { startDay, endDay } = workflowPeriodDays(data.bounds, period);
+	const key = `${startDay ?? ""}|${endDay ?? ""}`;
+	let byPeriod = workflowInsightMemo.get(snapshot);
+	if (!byPeriod) workflowInsightMemo.set(snapshot, (byPeriod = new Map()));
+	let insights = byPeriod.get(key);
+	if (!insights) byPeriod.set(key, (insights = workflowInsights(snapshot, startDay, endDay)));
+	return insights;
 }
